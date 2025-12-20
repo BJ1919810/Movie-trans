@@ -1,9 +1,3 @@
-﻿// 🐾 清雨出品｜.NET 10 + NAudio 2.2.1 防死循环完美版 ✅
-// ✅ 修复所有编译错误，特别是WasapiLoopbackCapture.Recording问题
-// ✅ 使用状态变量替代已弃用的Recording属性
-// ✅ 完整的空引用检查
-// ✅ 播放TTS时暂停捕获，彻底解决死循环
-
 using System;
 using System.Buffers;
 using System.Collections.Generic;
@@ -28,8 +22,6 @@ namespace RealtimeTranslator
 
         public static async Task Main(string[] args)
         {
-            Console.WriteLine("🐾 清雨的智能语音助手启动中... (Ctrl+C 退出)");
-            Console.WriteLine("🎯 防死循环版：播放时暂停捕获");
             Console.WriteLine("🔴 初始状态: 等待检测语音");
             Console.CancelKeyPress += (_, e) =>
             {
@@ -676,4 +668,5 @@ namespace RealtimeTranslator
             }
         }
     }
+
 }
