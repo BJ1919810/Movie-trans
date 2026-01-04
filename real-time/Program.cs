@@ -1,10 +1,4 @@
-﻿// 🐾 清雨出品｜.NET 10 + NAudio 2.2.1 防死循环完美版 ✅
-// ✅ 修复所有编译错误，特别是WasapiLoopbackCapture.Recording问题
-// ✅ 使用状态变量替代已弃用的Recording属性
-// ✅ 完整的空引用检查
-// ✅ 播放TTS时暂停捕获，彻底解决死循环
-
-using System;
+﻿using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
@@ -18,6 +12,8 @@ using System.Threading.Tasks;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
+using System.Drawing;      // 用于设置颜色和尺寸
+using System.Windows.Forms; // 用于创建窗口界面
 
 namespace RealtimeTranslator
 {
@@ -29,6 +25,33 @@ namespace RealtimeTranslator
         public static async Task Main(string[] args)
         {
             Console.WriteLine("🐾 清雨的智能语音助手启动中... (Ctrl+C 退出)");
+            // --- 新增：启动悬浮窗界面 ---
+            SubtitleWindow? subWindow;
+            var tcs = new TaskCompletionSource<SubtitleWindow>();
+
+            Thread uiThread = new Thread(() =>
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+
+                var win = new SubtitleWindow();
+
+                // ✅ 立刻通知主线程（不依赖 HandleCreated）
+                tcs.SetResult(win);
+
+                Application.Run(win);
+            });
+
+            uiThread.SetApartmentState(ApartmentState.STA);
+            // ✅ 不要设置为后台线程（默认就是前台）
+            uiThread.Start();
+
+            // 等待窗口对象创建完成
+            subWindow = await tcs.Task;
+
+
+            Console.WriteLine("🎯 窗口已就绪，正在启动音频服务...");
+                    // -----------------------
             Console.WriteLine("🎯 防死循环版：播放时暂停捕获");
             Console.WriteLine("🔴 初始状态: 等待检测语音");
             Console.CancelKeyPress += (_, e) =>
@@ -40,7 +63,7 @@ namespace RealtimeTranslator
 
             try
             {
-                var service = new AudioStreamingService(_httpClient, _cts.Token);
+                var service = new AudioStreamingService(_httpClient, _cts.Token, subWindow);
                 await service.RunAsync().WaitAsync(_cts.Token);
             }
             catch (OperationCanceledException)
@@ -76,6 +99,7 @@ namespace RealtimeTranslator
 
         private readonly HttpClient _httpClient;
         private readonly CancellationToken _cancellationToken;
+        private readonly SubtitleWindow? _window;
         private readonly string _serverUrl = "http://localhost:5000";
 
         // 播放
@@ -106,10 +130,11 @@ namespace RealtimeTranslator
             Processing
         }
 
-        public AudioStreamingService(HttpClient httpClient, CancellationToken cancellationToken)
+        public AudioStreamingService(HttpClient httpClient, CancellationToken cancellationToken, SubtitleWindow? subtitleWindow)
         {
             _httpClient = httpClient;
             _cancellationToken = cancellationToken;
+            _window = subtitleWindow;
         }
 
         public async Task RunAsync()
@@ -426,6 +451,13 @@ namespace RealtimeTranslator
                 // 5. 解析JSON响应
                 using var jsonDoc = JsonDocument.Parse(responseContent);
                 var root = jsonDoc.RootElement;
+
+                // 1. 从 root 中提取文本（注意：要匹配 Python 后端返回的字段名）
+                string original = root.TryGetProperty("text_original", out var op) ? op.GetString() ?? "" : "";
+                string translated = root.TryGetProperty("text_translated", out var tp) ? tp.GetString() ?? "" : "";
+
+                // 2. 调用悬浮窗更新文字
+                _window?.UpdateText(original, translated);
                 
                 if (root.TryGetProperty("wav_data", out var wavDataElem))
                 {
@@ -673,6 +705,223 @@ namespace RealtimeTranslator
             catch (Exception ex)
             {
                 Console.WriteLine($"🧹 清理异常: {ex.Message}");
+            }
+        }
+    }
+
+    // --- 歌词悬浮窗 ---
+    public class SubtitleWindow : Form
+    {
+        private OutlineLabel lblOriginal;
+        private OutlineLabel lblTranslated;
+
+        // Windows API 调用，用于实现鼠标穿透
+        [DllImport("user32.dll")]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int SetLayeredWindowAttributes(
+            IntPtr hwnd,
+            int crKey,
+            byte bAlpha,
+            int dwFlags
+        );
+
+        private const int LWA_ALPHA = 0x2;
+        private bool _dragging = false;
+        private Point _dragStart;
+        private bool _mouseTransparent = true;
+        [DllImport("user32.dll")]
+        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+        private void SetMouseTransparent(bool enable)
+        {
+            int style = GetWindowLong(this.Handle, -20);
+
+            if (enable)
+                SetWindowLong(this.Handle, -20, style | 0x80000 | 0x20); // WS_EX_LAYERED | WS_EX_TRANSPARENT
+            else
+                SetWindowLong(this.Handle, -20, style & ~0x20);          // 移除 TRANSPARENT
+
+            _mouseTransparent = enable;
+        }
+
+        private void SubtitleWindow_MouseDown(object? sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left && Control.ModifierKeys == Keys.Control)
+            {
+                _dragging = true;
+                _dragStart = e.Location;
+            }
+        }
+
+        private void SubtitleWindow_MouseMove(object? sender, MouseEventArgs e)
+        {
+            if (_dragging)
+            {
+                var screenPos = PointToScreen(e.Location);
+                this.Location = new Point(
+                    screenPos.X - _dragStart.X,
+                    screenPos.Y - _dragStart.Y
+                );
+            }
+        }
+
+        private void SubtitleWindow_MouseUp(object? sender, MouseEventArgs e)
+        {
+            if (_dragging)
+            {
+                _dragging = false;
+            }
+        }
+
+        private void SubtitleWindow_KeyDown(object? sender, KeyEventArgs e)
+        {
+            // 强制退出快捷键：Ctrl + C
+            if (e.Control && e.KeyCode == Keys.C)
+            {
+                Console.WriteLine("\n👋 收到强制退出指令 (Ctrl+C)...");
+                this.Hide();
+                Environment.Exit(0); // 彻底杀掉所有进程
+                return;
+            }
+            if (e.KeyCode == Keys.ControlKey && _mouseTransparent)
+            {
+                SetMouseTransparent(false); // 解锁
+            }
+        }
+
+        private void SubtitleWindow_KeyUp(object? sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.ControlKey && !_mouseTransparent)
+            {
+                SetMouseTransparent(true); // 重新锁定
+            }
+        }
+
+        public SubtitleWindow()
+        {
+            this.Size = new Size(1200, 180);
+            this.FormBorderStyle = FormBorderStyle.None;
+            this.TopMost = true;
+            this.ShowInTaskbar = false;
+
+            this.BackColor = Color.FromArgb(30, 30, 30);
+            this.TransparencyKey = Color.FromArgb(30, 30, 30);
+
+            lblOriginal = new OutlineLabel
+            {
+                Dock = DockStyle.Top,
+                ForeColor = Color.White,
+                OutlineColor = Color.Black,
+                OutlineWidth = 3f,
+                BackColor = Color.Transparent,
+                Font = new Font("Microsoft YaHei", 18),
+                Height = 50,
+                TextAlign = ContentAlignment.MiddleCenter
+            };
+
+            lblTranslated = new OutlineLabel
+            {
+                Dock = DockStyle.Bottom,
+                ForeColor = Color.Yellow,
+                OutlineColor = Color.Black,
+                OutlineWidth = 3f,
+                BackColor = Color.Transparent,
+                Font = new Font("Microsoft YaHei", 24, FontStyle.Bold),
+                Height = 100,
+                TextAlign = ContentAlignment.MiddleCenter
+            };
+
+            this.Controls.Add(lblOriginal);
+            this.Controls.Add(lblTranslated);
+            // 让点在文字上也能拖动窗口
+            lblOriginal.MouseDown += SubtitleWindow_MouseDown;
+            lblOriginal.MouseMove += SubtitleWindow_MouseMove;
+            lblOriginal.MouseUp   += SubtitleWindow_MouseUp;
+
+            lblTranslated.MouseDown += SubtitleWindow_MouseDown;
+            lblTranslated.MouseMove += SubtitleWindow_MouseMove;
+            lblTranslated.MouseUp   += SubtitleWindow_MouseUp;
+
+
+            this.MouseDown += SubtitleWindow_MouseDown;
+            this.MouseMove += SubtitleWindow_MouseMove;
+            this.MouseUp += SubtitleWindow_MouseUp;
+            this.KeyPreview = true;
+            this.KeyDown += SubtitleWindow_KeyDown;
+            this.KeyUp += SubtitleWindow_KeyUp;
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                // 0x80000 是 WS_EX_LAYERED, 0x20 是 WS_EX_TRANSPARENT
+                cp.ExStyle |= 0x80000; 
+                return cp;
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+
+            SetMouseTransparent(true);   // 设置 WS_EX_LAYERED | TRANSPARENT
+
+            this.Opacity = 0.75;
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+
+            var screen = Screen.FromControl(this).WorkingArea;
+
+            this.Location = new Point(
+                screen.Left + (screen.Width - this.Width) / 2,
+                screen.Bottom - this.Height - 40
+            );
+        }
+
+        public void UpdateText(string original, string translated)
+        {
+            if (this.InvokeRequired) {
+                this.BeginInvoke(new Action(() => UpdateText(original, translated)));
+                return;
+            }
+            lblOriginal.Text = original;
+            lblTranslated.Text = translated;
+        }
+    }
+    public class OutlineLabel : Label
+    {
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public Color OutlineColor { get; set; } = Color.Black;
+
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public float OutlineWidth { get; set; } = 2f;
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var path = new System.Drawing.Drawing2D.GraphicsPath())
+            {
+                // 将文字转化为路径
+                path.AddString(this.Text, this.Font.FontFamily, (int)this.Font.Style, 
+                            e.Graphics.DpiY * this.Font.SizeInPoints / 72, this.ClientRectangle, 
+                            new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center });
+
+                // 画描边
+                using (var pen = new Pen(OutlineColor, OutlineWidth) { LineJoin = System.Drawing.Drawing2D.LineJoin.Round })
+                {
+                    e.Graphics.DrawPath(pen, path);
+                }
+                // 填充文字颜色
+                using (var brush = new SolidBrush(this.ForeColor))
+                {
+                    e.Graphics.FillPath(brush, path);
+                }
             }
         }
     }

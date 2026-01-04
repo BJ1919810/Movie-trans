@@ -18,6 +18,7 @@
 - **流式ASR**：低延迟语音识别
 - **即时翻译**：实时文本翻译
 - **同步TTS**：实时语音合成，匹配原始说话人的语气
+- **双语字幕**：实时显示原文和翻译文本的双语字幕
 
 ## 项目结构
 
@@ -45,7 +46,7 @@ Movie-trans/
 
 ### 先决条件
 - Python 3.8+
-- .NET Core 5.0+（用于实时演示）
+- .NET 9.0.300+ SDK（用于实时演示）
 - 建议使用支持CUDA的GPU（以提高处理速度）
 
 ### 依赖安装
@@ -57,7 +58,11 @@ pip install -r requirements.txt
 
 2. 对于实时翻译演示：
 ```bash
-# 安装.NET依赖
+# 从 https://dotnet.microsoft.com/download/dotnet/9.0 下载并安装 .NET SDK 9.0.300
+# 安装后验证是否正常工作：
+dotnet --version
+
+# 然后恢复 .NET 项目依赖
 cd real-time
 dotnet restore
 ```

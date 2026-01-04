@@ -198,6 +198,59 @@ def download_hf_cache_models():
     print(f"HF缓存模型下载完成 ({success_count}/{len(hf_models)})")
     return success_count == len(hf_models)
 
+def download_faster_whisper_model():
+    """下载Faster-Whisper大型模型到asr/models目录"""
+    asr_models_dir = os.path.join(PROJECT_ROOT, "asr", "models")
+    os.makedirs(asr_models_dir, exist_ok=True)
+    
+    print("开始下载Faster-Whisper大型模型...")
+    
+    # 模型配置
+    model_name = "models--Systran--faster-whisper-large-v3"
+    repo_id = "Systran/faster-whisper-large-v3"
+    model_path = os.path.join(asr_models_dir, model_name)
+    
+    # 检查模型是否已存在
+    if os.path.exists(model_path):
+        print(f"  模型 {model_name} 已存在，跳过下载")
+        return True
+    
+    # 定义需要下载的文件
+    files = [
+        "config.json",
+        "model.bin",
+        "tokenizer.json",
+        "vocabulary.txt",
+        "preprocessor_config.json",
+        "vocabulary.json"
+    ]
+    
+    success = False
+    for attempt in range(2):
+        try:
+            print(f"  正在下载 {model_name} (尝试 {attempt + 1}/2)...")
+            snapshot_download(
+                repo_id=repo_id,
+                allow_patterns=files,
+                local_dir=model_path,
+                local_dir_use_symlinks=False
+            )
+            print(f"  ✓ {model_name} 下载完成")
+            success = True
+            break
+        except Exception as e:
+            print(f"  ✗ {model_name} 下载失败 (尝试 {attempt + 1}/2): {e}")
+            if attempt < 1:
+                print("  等待2秒后重试...")
+                time.sleep(2)
+    
+    if not success:
+        print(f"  ✗ {model_name} 下载最终失败")
+        return False
+    
+    return True
+
+
 def download_index_tts_models():
     """下载Index-TTS相关模型到index-tts/checkpoints目录"""
     index_tts_checkpoints_dir = os.path.join(PROJECT_ROOT, "index-tts", "checkpoints")
@@ -313,7 +366,11 @@ def main():
     if not download_hf_cache_models():
         print("HF缓存模型下载未完全成功")
     
-    # 4. 下载Index-TTS模型
+    # 4. 下载Faster-Whisper大型模型
+    if not download_faster_whisper_model():
+        print("Faster-Whisper大型模型下载未完全成功")
+    
+    # 5. 下载Index-TTS模型
     if not download_index_tts_models():
         print("Index-TTS模型下载未完全成功")
     

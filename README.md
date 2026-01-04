@@ -18,6 +18,7 @@ A versatile translation system supporting both file-based movie translation and 
 - **Streaming ASR**: Low-latency speech recognition
 - **Instant Translation**: Real-time text translation
 - **Synchronized TTS**: Real-time voice synthesis matching original speaker's tone
+- **Bilingual Subtitles**: Real-time bilingual subtitles display with original and translated text
 
 ## Project Structure
 
@@ -45,7 +46,7 @@ Movie-trans/
 
 ### Prerequisites
 - Python 3.8+
-- .NET Core 5.0+ (for real-time demo)
+- .NET 9.0.300+ SDK (for real-time demo)
 - CUDA-capable GPU recommended (for faster processing)
 
 ### Dependencies Installation
@@ -57,7 +58,11 @@ pip install -r requirements.txt
 
 2. For real-time translation demo:
 ```bash
-# Install .NET dependencies
+# Download and install .NET SDK 9.0.300 from https://dotnet.microsoft.com/download/dotnet/9.0
+# After installation, verify it works:
+dotnet --version
+
+# Then restore .NET project dependencies
 cd real-time
 dotnet restore
 ```
@@ -181,3 +186,5 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - DeepSeek for translation API
 - IndexTTS for voice synthesis
 - UVR5 for vocal isolation
+
+
