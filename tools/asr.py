@@ -6,6 +6,7 @@ import sys
 
 import argparse
 import json
+import re
 import time
 import traceback
 from pathlib import Path
@@ -165,33 +166,44 @@ def transcribe_with_faster_whisper(audio_file, model, language=None):
         return ""
 
 
+CLIP_TIME_RE = re.compile(r"(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)")
+CLIP_SPK_RE = re.compile(r"clip_(\w+?)_\d+_")
+
+
 def get_clip_info_from_filename(filename):
-    """从文件名中提取片段信息"""
-    # 文件名格式: clip_00_001_14.73-15.29.wav
-    parts = filename.split("_")
-    # 将clip_00_001转换为SPEAKER_00
-    speaker_id = parts[1]  # 00
-    speaker = f"SPEAKER_{speaker_id}"
-    
-    time_range = parts[3].replace(".wav", "")
-    start_time, end_time = time_range.split("-")
-    
+    """从文件名中提取片段信息
+
+    格式: clip_00_001_14.73-15.29.wav（兼容带尾部后缀的命名，如 clip_00_001_14.73-15.29_00.wav）
+    早期实现用 split("_") 取 parts[3]，遇到后缀就会解析错；改用正则。
+    """
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    spk_m = CLIP_SPK_RE.search(stem)
+    time_m = CLIP_TIME_RE.search(stem)
+    if not spk_m or not time_m:
+        return None
     return {
-        "speaker": speaker,
-        "start": float(start_time),
-        "end": float(end_time)
+        "speaker": f"SPEAKER_{spk_m.group(1)}",
+        "start": float(time_m.group(1)),
+        "end": float(time_m.group(2)),
     }
 
 
-def find_matching_segment(segments, clip_info):
-    """在segments中查找匹配的片段"""
+def find_matching_segment(segments, clip_info, tolerance=0.05):
+    """在 segments 中查找匹配的片段
+
+    注意：JSON 里的 start/end 可能被人工标注工具改过小数位，
+    早期实现用 float 精确相等比较，一改就全段匹配失败（表现为"全部识别失败"）。
+    这里改成按说话人 + 数值容差匹配。
+    """
+    best, best_err = None, None
     for segment in segments:
-        # 检查说话人是否匹配
-        if segment["speaker"] == clip_info["speaker"]:
-            # 检查时间是否匹配（允许更大误差）
-            if (segment["start"] == clip_info["start"]) and (segment["end"] == clip_info["end"]):
-                return segment
-    return None
+        if segment["speaker"] != clip_info["speaker"]:
+            continue
+        err = abs(segment["start"] - clip_info["start"]) + abs(segment["end"] - clip_info["end"])
+        if err <= tolerance * 2:
+            if best_err is None or err < best_err:
+                best, best_err = segment, err
+    return best
 
 
 def process_clips(clips_dir, diarization_file, model, language=None):
@@ -259,10 +271,26 @@ def process_clips(clips_dir, diarization_file, model, language=None):
         # 更新进度条描述信息
         pbar.set_postfix({"已处理": total_processed, "错误": total_errors})
     
-    # 过滤掉raw_text为空的条目
+    # 过滤掉raw_text为空的条目（识别失败 / 纯音乐段）
+    # 注意：这些段会从主 JSON 移除，但**必须留痕**——早期版本直接删掉，
+    # 表现是"某几句台词凭空消失"，无法追溯。这里额外写审计文件 + 打印时间范围。
     filtered_segments = [segment for segment in segments if segment.get('raw_text', '').strip()]
-    removed_count = len(segments) - len(filtered_segments)
-    
+    dropped_segments = [segment for segment in segments if not segment.get('raw_text', '').strip()]
+    removed_count = len(dropped_segments)
+
+    if dropped_segments:
+        dropped_path = os.path.join(os.path.dirname(os.path.abspath(diarization_file)), "asr_dropped_segments.json")
+        try:
+            with open(dropped_path, "w", encoding="utf-8") as f:
+                json.dump(dropped_segments, f, ensure_ascii=False, indent=2)
+            print(f"!! 有 {removed_count} 段识别结果为空，已从主 JSON 移除，明细写入: {dropped_path}")
+            for seg in dropped_segments:
+                print(f"   - {seg.get('speaker')} {seg.get('start')}-{seg.get('end')}s （原文本为空，需人工补录）")
+        except Exception as e:  # noqa: BLE001
+            print(f"!! 写入丢段审计文件失败: {e}")
+            for seg in dropped_segments:
+                print(f"   - 丢段: {seg.get('speaker')} {seg.get('start')}-{seg.get('end')}s")
+
     # 保存更新后的结果
     with open(diarization_file, 'w', encoding='utf-8') as f:
         json.dump(filtered_segments, f, ensure_ascii=False, indent=2)

@@ -201,13 +201,13 @@ def preload_models():
         
         if os.path.exists(tts_config_path) and os.path.exists(tts_model_dir):
             try:
-                from indextts.infer_v2 import IndexTTS2
+                from indextts.infer_v2_5 import IndexTTS2
                 preloaded_models['tts'] = IndexTTS2(
                     cfg_path=tts_config_path,
                     model_dir=tts_model_dir,
-                    use_fp16=True
+                    use_bf16=True
                 )
-                logger.info("IndexTTS模型初始化完成(已启用DeepSpeed优化)")
+                logger.info("IndexTTS-2.5 模型初始化完成(bf16)")
             except Exception as e:
                 logger.error(f"加载IndexTTS模型失败: {e}")
                 preloaded_models['tts'] = None
@@ -464,9 +464,11 @@ def translate_text(text, target_language="zh", source_language="en"):
         traceback.print_exc()
         return text  # 返回原文本作为fallback
 
-def tts_synthesis_streaming(text, reference_audio=None, output_path=None):
+def tts_synthesis_streaming(text, reference_audio=None, output_path=None, lang="ZH"):
     """
     使用预加载的TTS合成语音并返回音频流
+
+    lang: IndexTTS-2.5 必填，ZH / EN / JA / ES / AR
     """
     try:
         logger.info(f"🎵 使用TTS合成语音流: {text}")
@@ -495,6 +497,7 @@ def tts_synthesis_streaming(text, reference_audio=None, output_path=None):
             text=text,
             spk_audio_prompt=reference_audio,  # ✅ 现在使用16kHz参考音频
             output_path=output_path,
+            lang=lang,
             #stream_return=True,
             #verbose=True
         )
@@ -512,6 +515,7 @@ def tts_synthesis_streaming(text, reference_audio=None, output_path=None):
             result = tts.infer(
                 text=text,
                 output_path=output_path,
+                lang=lang,
                 #stream_return=True,
                 #verbose=True
             )
@@ -585,7 +589,10 @@ def infer_wav():
                 tts.infer(
                     text=translated_text,
                     spk_audio_prompt=ref_audio_16k_path,
-                    output_path=tts_output_path
+                    output_path=tts_output_path,
+                    lang={"zh": "ZH", "en": "EN", "ja": "JA", "es": "ES", "ar": "AR"}.get(
+                        str(target_language).lower(), "ZH"
+                    )
                 )
             else:
                 return jsonify({"error": "TTS模型未加载"}), 500

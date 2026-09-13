@@ -89,7 +89,7 @@ def process_video(video_file_path, output_dir=None):
     except Exception as e:
         return None, f"💥 Error: {type(e).__name__}: {str(e)}"
 
-def denoise_audio(input_audio_path):
+def denoise_audio(input_audio_path, model_name=None, agg=None, fp16=False):
     try:
         if not input_audio_path or not os.path.exists(input_audio_path):
             return None, None, None, "❌ Input audio file not found."
@@ -101,6 +101,12 @@ def denoise_audio(input_audio_path):
 
         denoise_script = os.path.join(PROJECT_DIR, "tools", "denoise.py")
         cmd = [sys.executable, denoise_script, "--input", target_input, "--output-dir", TEMP_DIR]
+        if model_name:
+            cmd += ["--model-name", str(model_name)]
+        if agg is not None:
+            cmd += ["--agg", str(int(agg))]
+        if fp16:
+            cmd.append("--fp16")
         result = subprocess.run(
             cmd, capture_output=True, text=True, cwd=PROJECT_DIR, timeout=600
         )
@@ -127,7 +133,9 @@ def denoise_audio(input_audio_path):
     except Exception as e:
         return None, None, None, f"💥 Error: {type(e).__name__}: {str(e)}"
 
-def run_speaker_diarization(audio_file_path, expected_json=None):
+def run_speaker_diarization(audio_file_path, expected_json=None,
+                            cluster_threshold=None, min_cluster_size=None,
+                            min_duration_off=None):
     try:
         if not audio_file_path or not os.path.exists(audio_file_path):
             return None, "❌ Input audio not found."
@@ -141,6 +149,12 @@ def run_speaker_diarization(audio_file_path, expected_json=None):
 
         diar_script = os.path.join(PROJECT_DIR, "tools", "speaker_diarization.py")
         cmd = [sys.executable, diar_script, "--audio", target_audio, "--output", expected_json]
+        if cluster_threshold is not None:
+            cmd += ["--threshold", str(cluster_threshold)]
+        if min_cluster_size is not None:
+            cmd += ["--min-cluster-size", str(int(min_cluster_size))]
+        if min_duration_off is not None:
+            cmd += ["--min-duration-off", str(min_duration_off)]
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=600, cwd=os.path.dirname(diar_script)
         )
@@ -165,7 +179,7 @@ def run_speaker_diarization(audio_file_path, expected_json=None):
     except Exception as e:
         return None, f"💥 Error: {type(e).__name__}: {str(e)}"
 
-def run_merge_speaker_segments(json_file_path):
+def run_merge_speaker_segments(json_file_path, max_gap=None, min_duration=None, max_duration=None):
     try:
         if not json_file_path or not os.path.exists(json_file_path):
             return None, "❌ Input JSON not found."
@@ -175,6 +189,12 @@ def run_merge_speaker_segments(json_file_path):
 
         merge_script = os.path.join(PROJECT_DIR, "tools", "merge_speaker_segments.py")
         cmd = [sys.executable, merge_script, "--input", target_json, "--output", target_json]
+        if max_gap is not None:
+            cmd += ["--max-gap", str(max_gap)]
+        if min_duration is not None:
+            cmd += ["--min-duration", str(min_duration)]
+        if max_duration is not None:
+            cmd += ["--max-duration", str(max_duration)]
         result = subprocess.run(
             cmd, capture_output=True, text=True, cwd=PROJECT_DIR, timeout=300
         )
@@ -231,7 +251,7 @@ def run_create_clips(audio_file_path, json_file_path):
     except Exception as e:
         return None, f"💥 Error: {type(e).__name__}: {str(e)}"
 
-def run_asr(clips_dir, json_file_path, language):
+def run_asr(clips_dir, json_file_path, language, model_size=None, device=None, compute_type=None):
     try:
         # 确保文件在标准位置
         expected_clips = os.path.join(TEMP_DIR, "clips")
@@ -249,6 +269,12 @@ def run_asr(clips_dir, json_file_path, language):
         cmd = [sys.executable, asr_script]
         if language and language != "auto":
             cmd += ["--language", language]
+        if model_size:
+            cmd += ["--model_size", str(model_size)]
+        if device:
+            cmd += ["--device", str(device)]
+        if compute_type:
+            cmd += ["--compute_type", str(compute_type)]
 
         result = subprocess.run(
             cmd, capture_output=True, text=True, cwd=PROJECT_DIR, timeout=600
@@ -268,19 +294,46 @@ def run_asr(clips_dir, json_file_path, language):
         return None, f"💥 Error: {type(e).__name__}: {str(e)}"
 
 # ==================== Annotation UI Control ====================
+def _free_annotate_port():
+    """杀掉占用标注端口的进程（tracked 进程若已崩，端口可能被残留进程占着）"""
+    try:
+        if os.name == 'nt':  # Windows 没有 lsof，用 netstat + taskkill
+            subprocess.run(
+                f"for /f \"tokens=5\" %a in ('netstat -ano ^| findstr :{ANNOTATE_PORT}') do taskkill /F /PID %a",
+                shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        else:  # Unix-like
+            subprocess.run(
+                f"lsof -ti :{ANNOTATE_PORT} | xargs kill -9",
+                shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+    except Exception:
+        pass  # 没有占用进程时忽略
+
+
+def is_annotate_running():
+    """标注 WebUI 是否真的在跑（判断开/关状态只看进程，不看状态栏文字）"""
+    return bool(ANNOTATE_PROCESS) and ANNOTATE_PROCESS.poll() is None
+
+
 def start_annotate_ui(json_path: str, enabled: bool):
     """Start/Stop the annotation WebUI."""
     global ANNOTATE_PROCESS
 
     if not enabled:
-        # Stop
+        # Stop：先优雅终止，再把端口彻底让出来
         if ANNOTATE_PROCESS and ANNOTATE_PROCESS.poll() is None:
             try:
                 ANNOTATE_PROCESS.terminate()
                 ANNOTATE_PROCESS.wait(timeout=5)
-            except:
-                ANNOTATE_PROCESS.kill()
-        return "⏹️ 标注 WebUI 已停止", ""
+            except Exception:
+                try:
+                    ANNOTATE_PROCESS.kill()
+                except Exception:
+                    pass
+        _free_annotate_port()
+        ANNOTATE_PROCESS = None
+        return "⏹️ 已停止（端口已释放）", ""
 
     # Start
     if not json_path or not os.path.exists(json_path):
@@ -289,17 +342,8 @@ def start_annotate_ui(json_path: str, enabled: bool):
     target_json = os.path.join(RESULTS_DIR, "speaker_diarization.json")
     safe_copy(json_path, target_json)
 
-    # Kill any process occupying ANNOTATE_PORT before starting
-    try:
-        # Windows doesn't have lsof, use netstat and taskkill instead
-        if os.name == 'nt':  # Windows
-            subprocess.run(f"for /f \"tokens=5\" %a in ('netstat -ano ^| findstr :{ANNOTATE_PORT}') do taskkill /F /PID %a", 
-                           shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:  # Unix-like systems
-            subprocess.run(f"lsof -ti :{ANNOTATE_PORT} | xargs kill -9", 
-                           shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except:
-        pass  # Ignore errors if no process is found
+    # 启动前清掉端口占用
+    _free_annotate_port()
 
     # Additional wait to ensure port is released
     import time
@@ -319,26 +363,28 @@ def start_annotate_ui(json_path: str, enabled: bool):
         import time
         time.sleep(3)
         if ANNOTATE_PROCESS.poll() is not None:
-            return "❌ 标注 WebUI 启动失败（请检查 annotate.py 权限）", ""
+            ANNOTATE_PROCESS = None
+            return "❌ 标注 WebUI 启动失败（请检查端口是否被占用 / 控制台报错）", ""
 
         url = f"http://localhost:{ANNOTATE_PORT}"
-        
+
         # 自动打开浏览器
         try:
             import webbrowser
             webbrowser.open(url)
         except Exception as e:
             print(f"无法自动打开浏览器: {e}")
-        
-        return f"✅ 标注 WebUI 已启动！\n请访问: {url}", url
+
+        # 状态文字与 get_annotate_status() 保持一致，避免前端状态与真实状态不符
+        return f"✅ 运行中\n🔗 {url}", url
 
     except Exception as e:
+        ANNOTATE_PROCESS = None
         return f"💥 启动异常: {type(e).__name__}: {str(e)}", ""
 
 def get_annotate_status():
     """Get current annotation UI status."""
-    global ANNOTATE_PROCESS
-    if ANNOTATE_PROCESS and ANNOTATE_PROCESS.poll() is None:
+    if is_annotate_running():
         url = f"http://localhost:{ANNOTATE_PORT}"
         return f"✅ 运行中\n🔗 {url}", url
     else:
@@ -347,19 +393,41 @@ def get_annotate_status():
 # ==================== Pipeline Wrappers ====================
 def run_pipeline(video_file, output_dir):
     if video_file is None:
-        return None, "⚠️ Please upload a video file."
-    return process_video(video_file.name, output_dir)
+        # 第三个输出不动（保留用户当前填的路径），避免误清空
+        return None, gr.update(), "⚠️ Please upload a video file."
+    audio_path, message = process_video(video_file.name, output_dir)
+    # 把真实音频路径回填到"降噪"输入框：抽完音频即可直接点降噪，
+    # 不用手动改路径——手改极易用了上一部片子的旧 output_audio.wav
+    path_update = audio_path if audio_path else gr.update()
+    return audio_path, path_update, message
 
-def run_denoise_pipeline(audio_file_path):
-    return denoise_audio(audio_file_path)
+def run_denoise_pipeline(audio_file_path, model_name=None, agg=None, fp16=False):
+    return denoise_audio(audio_file_path, model_name, agg, fp16)
 
-def run_asr_pipeline(vocal_16k_path, vocal_44k_path, json_file_path, language):
+def run_asr_pipeline(vocal_16k_path, vocal_44k_path, json_file_path, language,
+                     cluster_threshold=None, min_cluster_size=None,
+                     max_gap=None, min_duration=None, max_duration=None,
+                     model_size=None, device=None, compute_type=None):
+    # UI 里的 "auto" 表示"不传，用脚本自己的默认值"
+    if model_size in (None, "", "auto"):
+        model_size = None
+    if device in (None, "", "auto"):
+        device = None
+    if compute_type in (None, "", "auto"):
+        compute_type = None
+
     # 初始化状态日志
     status_log = []
     
     # 步骤1: 说话人分离
-    status_log.append("🗣️ 开始说话人分离...")
-    json_path, msg1 = run_speaker_diarization(vocal_16k_path, json_file_path)
+    status_log.append(
+        f"🗣️ 开始说话人分离...（聚类阈值={cluster_threshold}，最小簇={min_cluster_size}）"
+    )
+    json_path, msg1 = run_speaker_diarization(
+        vocal_16k_path, json_file_path,
+        cluster_threshold=cluster_threshold,
+        min_cluster_size=min_cluster_size,
+    )
     if json_path:
         status_log.append("✅ 说话人分离完成！")
     else:
@@ -367,8 +435,12 @@ def run_asr_pipeline(vocal_16k_path, vocal_44k_path, json_file_path, language):
         return None, None, "\n".join(status_log) + "\n" + msg1
 
     # 步骤2: 合并说话人片段
-    status_log.append("🔗 开始合并相邻说话人片段...")
-    merged_json, msg2 = run_merge_speaker_segments(json_path)
+    status_log.append(
+        f"🔗 开始合并相邻说话人片段...（间隔≤{max_gap}s 合并，<{min_duration}s 丢弃，上限 {max_duration}s）"
+    )
+    merged_json, msg2 = run_merge_speaker_segments(
+        json_path, max_gap=max_gap, min_duration=min_duration, max_duration=max_duration
+    )
     if merged_json:
         status_log.append("✅ 相邻说话人片段合并完成！")
     else:
@@ -385,8 +457,9 @@ def run_asr_pipeline(vocal_16k_path, vocal_44k_path, json_file_path, language):
         return None, None, "\n".join(status_log) + "\n" + msg1 + "\n" + msg2 + "\n" + msg3
 
     # 步骤4: 运行ASR
-    status_log.append("📝 开始语音识别...")
-    final_json, msg4 = run_asr(clips_dir, merged_json, language)
+    status_log.append(f"📝 开始语音识别...（模型={model_size}，设备={device}）")
+    final_json, msg4 = run_asr(clips_dir, merged_json, language,
+                               model_size=model_size, device=device, compute_type=compute_type)
     if final_json:
         status_log.append("✅ 语音识别完成！")
     else:
@@ -441,287 +514,432 @@ def translate_segments(json_file_path, raw_language, target_language, api_key):
     except Exception as e:
         return None, f"💥 Translation error: {type(e).__name__}: {str(e)}"
 
+# ==================== TTS & Merge Functions ====================
+def run_batch_tts_func(json_file_path, lang, emo_mode, duration_factor,
+                       spk_ref_mode="segment", emo_alpha=1.0,
+                       max_mel_tokens=1815, sort_by_speaker=True, emo_vector=""):
+    """运行批量TTS生成（生成器：逐行推送日志，长任务可实时看进度）"""
+    if not json_file_path or not os.path.exists(json_file_path):
+        yield "❌ Input JSON not found."
+        return
+
+    try:
+        # 确保目标文件在标准位置
+        target_json = os.path.join(RESULTS_DIR, "speaker_diarization.json")
+        safe_copy(json_file_path, target_json)
+
+        # 运行 batch_tts.py，把 2.5 的选项全部通过环境变量传进去
+        tts_script = os.path.join(PROJECT_DIR, "tools", "batch_tts.py")
+        cmd = [sys.executable, tts_script]
+        env = os.environ.copy()
+        env.update({
+            "TTS_LANG": str(lang).upper(),
+            "TTS_DURATION_FACTOR": str(duration_factor),
+            "TTS_EMO_MODE": emo_mode,
+            "SPK_REF_MODE": spk_ref_mode,
+            "TTS_EMO_ALPHA": str(emo_alpha),
+            "TTS_MAX_MEL_TOKENS": str(int(max_mel_tokens)),
+            "TTS_SORT_BY_SPEAKER": "true" if sort_by_speaker else "false",
+        })
+        if emo_vector and str(emo_vector).strip():
+            env["TTS_EMO_VECTOR"] = str(emo_vector).strip()
+
+        output_lines = []
+
+        def tail():
+            return "".join(output_lines[-100:])
+
+        yield (
+            f"🚀 启动批量 TTS\n"
+            f"  语言={lang} | 情绪={emo_mode}(α={emo_alpha}) | 整片语速x{duration_factor}\n"
+            f"  音色参考={spk_ref_mode} | 单段长度上限={int(max_mel_tokens)}\n"
+            f"  首次运行需加载 ~7GB 权重，请耐心等待..."
+        )
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            env=env,
+            cwd=PROJECT_DIR
+        )
+
+        # 实时读取输出并逐行推送
+        for line in process.stdout:
+            output_lines.append(line)
+            yield tail()
+
+        process.wait()
+
+        if process.returncode != 0:
+            yield f"❌ Batch TTS failed:\n{tail()}"
+        else:
+            yield f"✅ Batch TTS completed successfully!\n{tail()}"
+
+    except Exception as e:
+        yield f"💥 Error: {type(e).__name__}: {str(e)}"
+
+
+def run_merge_tts_video_func(enable_subtitles, burn_subtitles, output_format,
+                             align_tts=True, align_max_rate=1.25, align_min_dev=0.05,
+                             align_trim_overflow=False, tts_fade_ms=15):
+    """运行视频合并（按段对齐参数经环境变量传给脚本）"""
+    try:
+        # 运行merge_tts_video_improved.py脚本
+        merge_script = os.path.join(PROJECT_DIR, "tools", "merge_tts_video_improved.py")
+        cmd = [sys.executable, merge_script]
+
+        # 添加参数
+        if enable_subtitles:
+            cmd.append("--enable-subtitles")
+        if burn_subtitles:
+            cmd.append("--burn-subtitles")
+        cmd.extend(["--output-format", output_format])
+
+        # 按段对齐（atempo 保音高）参数通过环境变量传递
+        env = os.environ.copy()
+        env.update({
+            "ALIGN_TTS": "true" if align_tts else "false",
+            "ALIGN_MAX_RATE": str(align_max_rate),
+            "ALIGN_MIN_DEV": str(align_min_dev),
+            "ALIGN_TRIM_OVERFLOW": "true" if align_trim_overflow else "false",
+            "TTS_FADE_MS": str(int(tts_fade_ms)),
+        })
+
+        prefix = (
+            f"🎬 合并参数：字幕={enable_subtitles}(硬烧={burn_subtitles}) 格式={output_format}\n"
+            f"   按段对齐={align_tts}(最大倍率 {align_max_rate}, 偏差阈值 {align_min_dev}, "
+            f"裁剪超长={align_trim_overflow}, 淡入淡出 {int(tts_fade_ms)}ms)\n"
+        )
+
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=PROJECT_DIR, timeout=1200, env=env  # 20分钟超时
+        )
+
+        if result.returncode != 0:
+            return f"❌ Merge TTS & Video failed:\n{prefix}\n{result.stderr}"
+
+        output_video_path = os.path.join(RESULTS_DIR, f"output_improved.{output_format}")
+        if os.path.exists(output_video_path):
+            return f"{prefix}✅ Merge TTS & Video completed successfully!\nOutput video: {output_video_path}\n{result.stdout}", output_video_path
+        else:
+            return f"{prefix}⚠️ Merge completed but output video not found.\n{result.stdout}", None
+
+    except subprocess.TimeoutExpired:
+        return "⏱️ Timeout: Merge TTS & Video took too long.", None
+    except Exception as e:
+        return f"💥 Error: {type(e).__name__}: {str(e)}", None
+
+
 # ==================== Gradio UI ====================
-with gr.Blocks(title="Movie-trans Video Processing") as demo:
+def load_json_content(json_file):
+    """读取 JSON 供预览面板显示"""
+    if json_file and os.path.exists(json_file):
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            return {"error": f"JSON 加载失败: {str(e)}"}
+    return {"info": "请选择 JSON 文件"}
+
+
+with gr.Blocks(title="Movie-trans 视频处理全流程") as demo:
     gr.Markdown("# 🎬 Movie-trans 视频处理全流程")
+    gr.Markdown(
+        "抽音频 → 降噪分离 → 说话人分离 / ASR → 标注校对 → 翻译 → 批量 TTS → 回填合片。\n\n"
+        "> **⚙️ 折叠区 = 高级参数**，都已按最优值预设，不确定就别动。\n"
+        "> **TTS 必须单进程线性跑**：同时开两个进程不会报 OOM，而是静默降质（听起来像严重失真的噪声）。"
+    )
 
-    with gr.Tab("Extra & Denoise audio"):
+    # ==================== ① 抽音频 & 降噪 ====================
+    with gr.Tab("① 抽音频 & 降噪"):
         with gr.Row():
-            with gr.Column():
-                gr.Markdown("## 📤 视频处理")
-                video_input = gr.File(label="上传视频", file_types=[".mp4", ".avi", ".mov", ".mkv"])
-                output_dir = gr.Textbox(label="输出目录", value=TEMP_DIR)
-                process_btn = gr.Button("🚀 处理视频", variant="primary")
+            with gr.Column(scale=1):
+                with gr.Group():
+                    gr.Markdown("### 📤 从视频抽音频")
+                    video_input = gr.File(label="上传视频", file_types=[".mp4", ".avi", ".mov", ".mkv"])
+                    output_dir = gr.Textbox(label="音频输出目录", value=TEMP_DIR)
+                    process_btn = gr.Button("🚀 抽取音频", variant="primary")
 
-                gr.Markdown("## 🔇 降噪分离")
-                audio_input_path = gr.Textbox(label="音频路径", value=os.path.join(TEMP_DIR, "output_audio.wav"))
-                denoise_btn = gr.Button("🔊 降噪", variant="primary")
+                with gr.Group():
+                    gr.Markdown("### 🔇 降噪 & 人声分离")
+                    audio_input_path = gr.Textbox(
+                        label="待处理音频", value=os.path.join(TEMP_DIR, "output_audio.wav"),
+                        info="抽完音频会自动回填，直接点降噪即可"
+                    )
+                    denoise_btn = gr.Button("🔊 开始降噪", variant="primary")
 
-            with gr.Column():
-                gr.Markdown("## 📁 结果")
-                audio_output = gr.Audio(label="提取音频")
-                with gr.Row():
-                    vocal_16k_output = gr.Audio(label="🎤 人声 (16kHz)")
-                    vocal_44k_output = gr.Audio(label="🎤 人声 (44.1kHz)")
-                    bg_output = gr.Audio(label="🎧 背景音")
-                status_output = gr.Textbox(label="📝 状态", lines=8)
+                    with gr.Accordion("⚙️ 高级：降噪参数", open=False):
+                        denoise_model = gr.Textbox(
+                            label="UVR5 模型名", value="HP2_all_vocals",
+                            info="须是 uvr5/uvr5_weights/ 下已存在的 .pth 模型名"
+                        )
+                        denoise_agg = gr.Slider(
+                            label="人声提取激进程度", minimum=0, maximum=20, value=10, step=1,
+                            info="越高越激进地切掉伴奏，可能削到人声；15 以上慎用"
+                        )
+                        denoise_fp16 = gr.Checkbox(label="半精度推理（省显存，默认关）", value=False)
 
-    with gr.Tab("ASR"):
+            with gr.Column(scale=1):
+                with gr.Group():
+                    gr.Markdown("### 📁 结果")
+                    audio_output = gr.Audio(label="抽取的音频")
+                    with gr.Row():
+                        vocal_16k_output = gr.Audio(label="🎤 人声 16kHz")
+                        vocal_44k_output = gr.Audio(label="🎤 人声 44.1kHz")
+                        bg_output = gr.Audio(label="🎧 背景音")
+                    status_output = gr.Textbox(label="📝 状态", lines=12, elem_classes=["log-box"])
+
+    # ==================== ② ASR & 切段 ====================
+    with gr.Tab("② ASR & 切段"):
         with gr.Row():
-            with gr.Column():
-                gr.Markdown("## 🧠 ASR 流程")
-                asr_vocal_16k = gr.Textbox(label="16kHz 人声", value=os.path.join(TEMP_DIR, "vocal_1_16000.wav"))
-                asr_vocal_44k = gr.Textbox(label="44.1kHz 人声", value=os.path.join(TEMP_DIR, "vocal_1_44100.wav"))
-                asr_json_file = gr.Textbox(label="说话人 JSON", value=os.path.join(RESULTS_DIR, "speaker_diarization.json"))
-                asr_language = gr.Dropdown(label="语言", choices=["zh", "en", "ja", "ko", "auto"], value="auto")
-                run_asr_btn = gr.Button("🎯 运行 ASR", variant="primary")
+            with gr.Column(scale=1):
+                with gr.Group():
+                    gr.Markdown("### 🧠 输入")
+                    asr_vocal_16k = gr.Textbox(
+                        label="16kHz 人声（说话人分离用）",
+                        value=os.path.join(TEMP_DIR, "vocal_1_16000.wav")
+                    )
+                    asr_vocal_44k = gr.Textbox(
+                        label="44.1kHz 人声（切片段用）",
+                        value=os.path.join(TEMP_DIR, "vocal_1_44100.wav")
+                    )
+                    asr_json_file = gr.Textbox(
+                        label="说话人 JSON（输出位置）",
+                        value=os.path.join(RESULTS_DIR, "speaker_diarization.json")
+                    )
+                    asr_language = gr.Dropdown(
+                        label="语言", choices=["auto", "zh", "en", "ja", "ko"], value="auto",
+                        info="zh 走 FunASR Paraformer；其余走 faster-whisper"
+                    )
+                    run_asr_btn = gr.Button("🎯 运行 ASR 全流程", variant="primary")
 
-                gr.Markdown("## 📤 输出")
-                asr_json_output = gr.File(label="📄 转录 JSON")
-                asr_clips_dir = gr.Textbox(label="🎞️ 音频片段目录")
+                with gr.Accordion("⚙️ 高级：说话人分离 / 切段粒度 / ASR", open=False):
+                    with gr.Row():
+                        asr_cluster_threshold = gr.Slider(
+                            label="聚类阈值（越高说话人越少）",
+                            minimum=0.40, maximum=0.95, value=0.72, step=0.01
+                        )
+                        asr_min_cluster_size = gr.Number(
+                            label="最小簇大小（越小越易分出短插话）", value=15, precision=0
+                        )
+                    gr.Markdown(
+                        "<small>**切段粒度**决定时间轴粗细，直接影响后面每段 TTS 的长短："
+                        "间隔≤阈值合并、短于下限丢弃、合并后单段不超过上限。</small>"
+                    )
+                    with gr.Row():
+                        asr_max_gap = gr.Slider(label="可合并间隔 (s)", minimum=0.0, maximum=1.5, value=0.3, step=0.05)
+                        asr_min_duration = gr.Slider(label="丢弃短于 (s)", minimum=0.0, maximum=1.0, value=0.3, step=0.05)
+                        asr_max_duration = gr.Slider(label="单段上限 (s)", minimum=2.0, maximum=30.0, value=10.0, step=0.5)
+                    with gr.Row():
+                        asr_model_size = gr.Dropdown(
+                            label="Whisper 模型", choices=["large-v3", "large-v2", "medium", "small", "base"],
+                            value="large-v3", info="仅非中文时生效"
+                        )
+                        asr_device = gr.Dropdown(label="设备", choices=["auto", "cuda", "cpu"], value="auto")
+                        asr_compute_type = gr.Dropdown(
+                            label="精度", choices=["auto", "float16", "int8", "float32"], value="auto"
+                        )
 
-            with gr.Column():
-                gr.Markdown("## 📋 ASR 状态")
-                asr_json_viewer = gr.JSON(label="🔍 结果预览")
-                asr_status_output = gr.Textbox(label="日志", lines=10)
+                with gr.Group():
+                    gr.Markdown("### 📤 输出")
+                    asr_json_output = gr.File(label="📄 转录 JSON")
+                    asr_clips_dir = gr.Textbox(label="🎞️ 音频片段目录")
 
-                def load_json_content(json_file):
-                    if json_file and os.path.exists(json_file):
-                        try:
-                            with open(json_file, 'r', encoding='utf-8') as f:
-                                return json.load(f)
-                        except Exception as e:
-                            return {"error": f"JSON 加载失败: {str(e)}"}
-                    return {"info": "请选择 JSON 文件"}
+            with gr.Column(scale=1):
+                with gr.Group():
+                    gr.Markdown("### 📋 状态")
+                    asr_json_viewer = gr.JSON(label="🔍 结果预览")
+                    asr_status_output = gr.Textbox(label="日志", lines=16, elem_classes=["log-box"])
 
                 asr_json_output.change(fn=load_json_content, inputs=asr_json_output, outputs=asr_json_viewer)
 
-    with gr.Tab("Translate"):
+    # ==================== ③ 翻译 & 标注 ====================
+    with gr.Tab("③ 翻译 & 标注"):
         with gr.Row():
-            with gr.Column():
-                gr.Markdown("## 🌍 翻译流程")
-                trans_json_file = gr.Textbox(label="说话人 JSON", value=os.path.join(RESULTS_DIR, "speaker_diarization.json"))
-                trans_raw_language = gr.Dropdown(label="原始语言", choices=["zh", "en", "ja"], value="en")
-                trans_target_language = gr.Dropdown(label="目标语言", choices=["zh", "en", "ja"], value="zh")
-                trans_api_key = gr.Textbox(label="DeepSeek API Key", value=DEEPSEEK_API_KEY, type="password")
-                run_translate_btn = gr.Button("🔄 运行翻译", variant="primary")
-                
-                # 标注 WebUI 控制
-                gr.Markdown("## 🏷️ 音频标注 WebUI（人工校对）")
-                with gr.Row():
-                    annotate_status = gr.Textbox(label="状态", value="⏹️ 未运行", interactive=False, lines=2)
-                    annotate_url = gr.Textbox(label="访问链接", interactive=False, lines=2)
-                with gr.Row():
-                    start_annotate_btn = gr.Button("🚀 启动/停止标注", variant="primary")
-                    refresh_status_btn = gr.Button("🔁 刷新状态")
+            with gr.Column(scale=1):
+                with gr.Group():
+                    gr.Markdown("### 🌍 翻译")
+                    trans_json_file = gr.Textbox(
+                        label="说话人 JSON", value=os.path.join(RESULTS_DIR, "speaker_diarization.json")
+                    )
+                    with gr.Row():
+                        trans_raw_language = gr.Dropdown(label="原始语言", choices=["zh", "en", "ja"], value="en")
+                        trans_target_language = gr.Dropdown(label="目标语言", choices=["zh", "en", "ja"], value="zh")
+                    trans_api_key = gr.Textbox(
+                        label="DeepSeek API Key", value=DEEPSEEK_API_KEY, type="password",
+                        info="留空则用 .env 里的 DEEPSEEK_API_KEY"
+                    )
+                    run_translate_btn = gr.Button("🔄 运行翻译", variant="primary")
+                    gr.Markdown("<small>译文写入 `result_text`，原文保留在 `raw_text`。</small>")
 
-                gr.Markdown("## 📤 输出")
-                trans_json_output = gr.File(label="📄 翻译 JSON")
+                with gr.Group():
+                    gr.Markdown("### 🏷️ 音频标注 WebUI（人工校对）")
+                    with gr.Row():
+                        annotate_status = gr.Textbox(label="状态", value="⏹️ 未运行", interactive=False, lines=2)
+                        annotate_url = gr.Textbox(label="访问链接", interactive=False, lines=2)
+                    with gr.Row():
+                        start_annotate_btn = gr.Button("🚀 启动 / 停止标注", variant="primary")
+                        refresh_status_btn = gr.Button("🔁 刷新状态")
+                    gr.Markdown("<small>标注页可直接改原文/译文、对照试听 TTS、切分与合并片段。</small>")
 
-            with gr.Column():
-                gr.Markdown("## 📋 翻译状态")
-                trans_json_viewer = gr.JSON(label="🔍 结果预览")
-                trans_status_output = gr.Textbox(label="日志", lines=10)
+                with gr.Group():
+                    gr.Markdown("### 📤 输出")
+                    trans_json_output = gr.File(label="📄 翻译 JSON")
 
-                def load_json_content(json_file):
-                    if json_file and os.path.exists(json_file):
-                        try:
-                            with open(json_file, 'r', encoding='utf-8') as f:
-                                return json.load(f)
-                        except Exception as e:
-                            return {"error": f"JSON 加载失败: {str(e)}"}
-                    return {"info": "请选择 JSON 文件"}
+            with gr.Column(scale=1):
+                with gr.Group():
+                    gr.Markdown("### 📋 状态")
+                    trans_json_viewer = gr.JSON(label="🔍 结果预览")
+                    trans_status_output = gr.Textbox(label="日志", lines=16, elem_classes=["log-box"])
 
                 trans_json_output.change(fn=load_json_content, inputs=trans_json_output, outputs=trans_json_viewer)
 
-    # TTS & Merge 功能
-    # ==================== TTS & Merge Functions ====================
-    def run_batch_tts_func(json_file_path, lang, version, emo_mode, duration_factor):
-        """运行批量TTS生成（生成器：逐行推送日志，长任务可实时看进度）"""
-        import queue
-        import threading
-
-        if not json_file_path or not os.path.exists(json_file_path):
-            yield "❌ Input JSON not found."
-            return
-
-        try:
-            # 确保目标文件在标准位置
-            target_json = os.path.join(RESULTS_DIR, "speaker_diarization.json")
-            safe_copy(json_file_path, target_json)
-
-            # 运行 batch_tts.py，把 2.5 的新选项通过环境变量传进去
-            tts_script = os.path.join(PROJECT_DIR, "tools", "batch_tts.py")
-            cmd = [sys.executable, tts_script]
-            env = os.environ.copy()
-            env.update({
-                "TTS_LANG": lang,
-                "TTS_DURATION_FACTOR": str(duration_factor),
-                "TTS_EMO_MODE": emo_mode,
-                "INDEXTTS_VERSION": version,
-            })
-
-            output_lines = []
-
-            def tail():
-                return "".join(output_lines[-100:])
-
-            yield f"🚀 启动批量 TTS (lang={lang}, 版本={version}, 情绪={emo_mode}, 语速x{duration_factor})...\n首次运行需加载 ~7GB 权重，请耐心等待..."
-
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-                env=env,
-                cwd=PROJECT_DIR
-            )
-
-            # 实时读取输出并逐行推送
-            for line in process.stdout:
-                output_lines.append(line)
-                yield tail()
-
-            process.wait()
-
-            if process.returncode != 0:
-                yield f"❌ Batch TTS failed:\n{tail()}"
-            else:
-                yield f"✅ Batch TTS completed successfully!\n{tail()}"
-
-        except Exception as e:
-            yield f"💥 Error: {type(e).__name__}: {str(e)}"
-
-    def run_merge_tts_video_func(enable_subtitles, burn_subtitles, output_format):
-        """运行视频合并"""
-        try:
-            # 运行merge_tts_video_improved.py脚本
-            merge_script = os.path.join(PROJECT_DIR, "tools", "merge_tts_video_improved.py")
-            cmd = [sys.executable, merge_script]
-            
-            # 添加参数
-            if enable_subtitles:
-                cmd.append("--enable-subtitles")
-            if burn_subtitles:
-                cmd.append("--burn-subtitles")
-            cmd.extend(["--output-format", output_format])
-            
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, cwd=PROJECT_DIR, timeout=1200  # 20分钟超时
-            )
-            
-            if result.returncode != 0:
-                return f"❌ Merge TTS & Video failed:\n{result.stderr}"
-            
-            output_video_path = os.path.join(RESULTS_DIR, f"output_improved.{output_format}")
-            if os.path.exists(output_video_path):
-                return f"✅ Merge TTS & Video completed successfully!\nOutput video: {output_video_path}\n{result.stdout}", output_video_path
-            else:
-                return f"⚠️ Merge completed but output video not found.\n{result.stdout}", None
-            
-        except subprocess.TimeoutExpired:
-            return "⏱️ Timeout: Merge TTS & Video took too long.", None
-        except Exception as e:
-            return f"💥 Error: {type(e).__name__}: {str(e)}", None
-
-    with gr.Tab("TTS ＆ Merge"):
+    # ==================== ④ TTS & 合片 ====================
+    with gr.Tab("④ TTS & 合片"):
         with gr.Row():
-            with gr.Column():
-                gr.Markdown("## 🗣️ 批量TTS生成")
-                tts_json_file = gr.Textbox(label="说话人 JSON", value=os.path.join(RESULTS_DIR, "speaker_diarization.json"), lines=2)
-
-                # IndexTTS-2.5 新选项（通过环境变量传给 batch_tts.py）
-                with gr.Row():
-                    tts_lang = gr.Dropdown(label="合成语言", choices=["ZH", "EN", "JA", "ES", "AR"], value="ZH")
-                    tts_version = gr.Radio(label="推理器版本", choices=["2.5", "2"], value="2.5")
-                with gr.Row():
-                    tts_emo_mode = gr.Radio(
-                        label="情绪来源", choices=["ref", "text"], value="ref",
-                        info="ref=跟随原片演员表演（推荐配音）；text=Qwen按台词字面推断（适合有声书）"
+            with gr.Column(scale=1):
+                with gr.Group():
+                    gr.Markdown("### 🗣️ 批量 TTS（IndexTTS-2.5）")
+                    gr.Markdown(
+                        "<small>同声配音：每段译文用**它自己那段原片切片**同时作音色与情绪参考，"
+                        "逐段跟随原声。</small>"
                     )
+                    tts_json_file = gr.Textbox(
+                        label="说话人 JSON", value=os.path.join(RESULTS_DIR, "speaker_diarization.json")
+                    )
+                    with gr.Row():
+                        tts_lang = gr.Dropdown(label="合成语言", choices=["ZH", "EN", "JA", "ES", "AR"], value="ZH")
+                        tts_emo_mode = gr.Dropdown(
+                            label="情绪来源", choices=["ref", "text", "vector", "none"], value="ref",
+                            info="ref=跟随原片表演（配音推荐）/ text=按台词推断 / vector=固定向量 / none"
+                        )
                     tts_duration = gr.Slider(
-                        label="语速因子（<1 变快，>1 变慢）",
+                        label="整片语速因子（<1 变快，>1 变慢）",
                         minimum=0.5, maximum=2.0, value=1.0, step=0.05
                     )
+                    run_batch_tts_btn = gr.Button("🎵 运行批量 TTS", variant="primary")
 
-                run_batch_tts_btn = gr.Button("🎵 运行批量TTS", variant="primary")
-                
-                gr.Markdown("## 🎞️ 视频与人声合并")
-                merge_enable_subtitles = gr.Checkbox(label="启用双语字幕", value=True)
-                merge_burn_subtitles = gr.Checkbox(label="硬烧录字幕到视频帧（处理速度会比较慢）", value=True)
-                merge_output_format = gr.Radio(label="输出格式", choices=["mp4", "mkv"], value="mp4")
-                run_merge_tts_btn = gr.Button("🎬 运行视频合并", variant="primary")
-                
-                gr.Markdown("## 📂 输出文件")
-                tts_output_video = gr.File(label="📥 最终视频文件", file_count="single")
-                
-                def update_output_file():
-                    # 根据实际输出格式返回正确的文件路径
-                    output_video_path_mp4 = os.path.join(RESULTS_DIR, "output_improved.mp4")
-                    output_video_path_mkv = os.path.join(RESULTS_DIR, "output_improved.mkv")
-                    if os.path.exists(output_video_path_mp4):
-                        return output_video_path_mp4
-                    elif os.path.exists(output_video_path_mkv):
-                        return output_video_path_mkv
-                    return None
-                
-            with gr.Column():
-                gr.Markdown("## 📋 TTS & Merge 状态")
-                tts_status_output = gr.Textbox(label="🎵 TTS 日志", lines=10)
-                merge_status_output = gr.Textbox(label="🎬 合并日志", lines=10)
-                
-                # TTS & Merge Event Bindings
+                    with gr.Accordion("⚙️ 高级：TTS 参数", open=False):
+                        tts_spk_ref_mode = gr.Radio(
+                            label="音色参考策略", choices=["segment", "fixed"], value="segment",
+                            info="segment=每段用自身原片切片（同声配音正确解）；fixed=每说话人固定一段（更快但音色情绪会漂）"
+                        )
+                        tts_emo_alpha = gr.Slider(
+                            label="情绪强度 α", minimum=0.0, maximum=1.0, value=1.0, step=0.05
+                        )
+                        tts_max_mel_tokens = gr.Slider(
+                            label="单段长度上限 (mel tokens)", minimum=500, maximum=1815, value=1815, step=5,
+                            info="2.5 上限 1815；调小会静默截断较长台词"
+                        )
+                        tts_sort_by_speaker = gr.Checkbox(
+                            label="按说话人分组处理（仅 fixed 模式有提速收益）", value=True
+                        )
+                        tts_emo_vector = gr.Textbox(
+                            label="情绪向量（仅 vector 模式，8 维逗号分隔）", value="0,0,0,0,0,0,0,1"
+                        )
+
+                with gr.Group():
+                    gr.Markdown("### 🎞️ 与视频合并")
+                    with gr.Row():
+                        merge_enable_subtitles = gr.Checkbox(label="启用双语字幕", value=True)
+                        merge_burn_subtitles = gr.Checkbox(label="硬烧录进画面（较慢）", value=True)
+                        merge_output_format = gr.Radio(label="输出格式", choices=["mp4", "mkv"], value="mp4")
+                    run_merge_tts_btn = gr.Button("🎬 运行合并", variant="primary")
+
+                    with gr.Accordion("⚙️ 高级：按段时长对齐", open=False):
+                        merge_align_tts = gr.Checkbox(
+                            label="启用按段对齐（atempo 保音高，拉伸到原段时长）", value=True
+                        )
+                        with gr.Row():
+                            merge_align_max_rate = gr.Slider(
+                                label="最大伸缩倍率", minimum=1.0, maximum=2.0, value=1.25, step=0.05,
+                                info="1.25 = 语速最多变 ±25%，防止为对齐把语速拉变形"
+                            )
+                            merge_align_min_dev = gr.Slider(
+                                label="偏差阈值（低于此值不动）", minimum=0.0, maximum=0.3, value=0.05, step=0.01
+                            )
+                        merge_align_trim = gr.Checkbox(
+                            label="仍超长时裁到段长（否则只在日志告警）", value=False
+                        )
+                        merge_fade_ms = gr.Slider(
+                            label="每段淡入淡出 (ms)", minimum=0, maximum=200, value=15, step=5
+                        )
+
+                with gr.Group():
+                    gr.Markdown("### 📂 输出文件")
+                    tts_output_video = gr.File(label="📥 最终视频", file_count="single")
+
+            with gr.Column(scale=1):
+                with gr.Group():
+                    gr.Markdown("### 📋 状态")
+                    tts_status_output = gr.Textbox(label="🎵 TTS 日志", lines=16, elem_classes=["log-box"])
+                    merge_status_output = gr.Textbox(label="🎬 合并日志", lines=16, elem_classes=["log-box"])
+
                 run_batch_tts_btn.click(
                     fn=run_batch_tts_func,
-                    inputs=[tts_json_file, tts_lang, tts_version, tts_emo_mode, tts_duration],
+                    inputs=[
+                        tts_json_file, tts_lang, tts_emo_mode, tts_duration,
+                        tts_spk_ref_mode, tts_emo_alpha, tts_max_mel_tokens,
+                        tts_sort_by_speaker, tts_emo_vector,
+                    ],
                     outputs=[tts_status_output]
                 )
 
                 run_merge_tts_btn.click(
                     fn=run_merge_tts_video_func,
-                    inputs=[merge_enable_subtitles, merge_burn_subtitles, merge_output_format],
+                    inputs=[
+                        merge_enable_subtitles, merge_burn_subtitles, merge_output_format,
+                        merge_align_tts, merge_align_max_rate, merge_align_min_dev,
+                        merge_align_trim, merge_fade_ms,
+                    ],
                     outputs=[merge_status_output, tts_output_video]
                 )
 
-    # Event bindings
+    # ==================== Event bindings ====================
     process_btn.click(
         fn=run_pipeline,
         inputs=[video_input, output_dir],
-        outputs=[audio_output, status_output]
+        outputs=[audio_output, audio_input_path, status_output]
     )
     denoise_btn.click(
         fn=run_denoise_pipeline,
-        inputs=[audio_input_path],
+        inputs=[audio_input_path, denoise_model, denoise_agg, denoise_fp16],
         outputs=[vocal_16k_output, vocal_44k_output, bg_output, status_output]
     )
     run_asr_btn.click(
         fn=run_asr_pipeline,
-        inputs=[asr_vocal_16k, asr_vocal_44k, asr_json_file, asr_language],
+        inputs=[
+            asr_vocal_16k, asr_vocal_44k, asr_json_file, asr_language,
+            asr_cluster_threshold, asr_min_cluster_size,
+            asr_max_gap, asr_min_duration, asr_max_duration,
+            asr_model_size, asr_device, asr_compute_type,
+        ],
         outputs=[asr_json_output, asr_clips_dir, asr_status_output]
     )
-    
+
     # 翻译功能
     run_translate_btn.click(
         fn=translate_segments,
         inputs=[trans_json_file, trans_raw_language, trans_target_language, trans_api_key],
         outputs=[trans_json_output, trans_status_output]
     )
-    
+
     # 标注控制
-    def toggle_annotate(json_path, current_status):
-        # 根据当前状态决定是启动还是停止
-        if "运行中" in current_status:
-            # 当前正在运行，需要停止
+    def toggle_annotate(json_path):
+        # 只看真实进程状态：之前靠 "运行中" 字符串判断，而启动返回的是 "已启动"，
+        # 永远匹配不上 → 按钮只能开、关不掉
+        if is_annotate_running():
             return start_annotate_ui(json_path, False)
         else:
-            # 当前未运行，需要启动
             return start_annotate_ui(json_path, True)
-    
+
     start_annotate_btn.click(
         fn=toggle_annotate,
-        inputs=[trans_json_file, annotate_status],
+        inputs=[trans_json_file],
         outputs=[annotate_status, annotate_url]
     )
     refresh_status_btn.click(

@@ -261,107 +261,6 @@ def download_faster_whisper_model():
     return True
 
 
-def download_index_tts_models():
-    """下载Index-TTS相关模型到index-tts/checkpoints目录
-
-    注意：项目已升级到 **IndexTTS-2.5**（支持中/英/日/西/阿五语言），
-    请使用专用的下载脚本： ``python Download_indextts25.py`` （ModelScope 源，速度快）。
-    本函数保留仅用于回退到 IndexTTS-2 的场景。
-    """
-    index_tts_checkpoints_dir = os.path.join(PROJECT_ROOT, "index-tts", "checkpoints")
-    os.makedirs(index_tts_checkpoints_dir, exist_ok=True)
-    
-    print("开始下载Index-TTS模型...")
-    
-    # IndexTTS-2仓库中的文件列表
-    index_tts_files = [
-        ".gitattributes",
-        "README.md",
-        "bpe.model",
-        "config.yaml",
-        "feat1.pt",
-        "feat2.pt",
-        "gpt.pth",
-        "s2mel.pth",
-        "wav2vec2bert_stats.pt"
-    ]
-    
-    # 必需的核心模型文件（除了.gitattributes与README.md）
-    essential_files = [f for f in index_tts_files if f not in [".gitattributes", "README.md"]]
-    
-    success_count = 0
-    
-    # 检查核心模型文件是否存在
-    missing_essential_files = []
-    for filename in essential_files:
-        local_path = os.path.join(index_tts_checkpoints_dir, filename)
-        if not os.path.exists(local_path):
-            missing_essential_files.append(filename)
-    
-    # 如果qwen0.6bemo4-merge目录不存在或为空，也认为是缺失
-    qwen_model_dir = os.path.join(index_tts_checkpoints_dir, "qwen0.6bemo4-merge")
-    qwen_model_exists = os.path.exists(qwen_model_dir) and os.path.isdir(qwen_model_dir) and os.listdir(qwen_model_dir)
-    
-    # 如果所有必需文件都存在且qwen模型也存在，则跳过下载
-    if not missing_essential_files and qwen_model_exists:
-        print("  所有Index-TTS模型文件已存在，跳过下载")
-        success_count = len(index_tts_files) + 1  # +1 是因为 qwen0.6bemo4-merge
-        print(f"Index-TTS模型下载完成 ({success_count}/{len(index_tts_files)+1})")
-        return True
-    
-    # 否则下载缺失的文件和qwen模型
-    print("检测到部分模型文件缺失，开始下载...")
-    
-    # 检查并下载 qwen0.6bemo4-merge 文件夹
-    if not qwen_model_exists:
-        # 如果目录存在但为空，则删除它
-        if os.path.exists(qwen_model_dir):
-            shutil.rmtree(qwen_model_dir)
-        
-        # 下载 qwen0.6bemo4-merge 模型
-        print("正在下载 qwen0.6bemo4-merge...")
-        try:
-            snapshot_download(
-                repo_id="IndexTeam/IndexTTS-2",
-                allow_patterns="qwen0.6bemo4-merge/*",
-                local_dir=index_tts_checkpoints_dir,
-                local_dir_use_symlinks=False,
-                token=os.environ.get("HF_TOKEN") if os.environ.get("HF_TOKEN") != "YOUR_HF_TOKEN" else None
-            )
-            print("  ✓ qwen0.6bemo4-merge 下载完成")
-            success_count += 1
-        except Exception as e:
-            print(f"  ✗ qwen0.6bemo4-merge 下载失败: {e}")
-    else:
-        print("  模型 qwen0.6bemo4-merge 已存在，跳过下载")
-        success_count += 1
-    
-    # 检查并下载其他必需文件
-    for filename in index_tts_files:
-        # .gitattributes 和 README.md 总是重新下载以确保最新
-        if filename not in [".gitattributes", "README.md"] and filename not in missing_essential_files:
-            print(f"  文件 {filename} 已存在，跳过下载")
-            success_count += 1
-            continue
-            
-        local_path = os.path.join(index_tts_checkpoints_dir, filename)
-        print(f"正在下载 {filename}...")
-        try:
-            hf_hub_download(
-                repo_id="IndexTeam/IndexTTS-2",
-                filename=filename,
-                local_dir=index_tts_checkpoints_dir,
-                local_dir_use_symlinks=False,
-                token=os.environ.get("HF_TOKEN") if os.environ.get("HF_TOKEN") != "YOUR_HF_TOKEN" else None
-            )
-            print(f"  ✓ {filename} 下载完成")
-            success_count += 1
-        except Exception as e:
-            print(f"  ✗ {filename} 下载失败: {e}")
-    
-    print(f"Index-TTS模型下载完成 ({success_count}/{len(index_tts_files)+1})")  # +1 是因为 qwen0.6bemo4-merge
-    return success_count == len(index_tts_files) + 1
-
 def main():
     """主函数"""
     print("=" * 60)
@@ -385,9 +284,10 @@ def main():
     if not download_faster_whisper_model():
         print("Faster-Whisper大型模型下载未完全成功")
     
-    # 5. 下载Index-TTS模型
-    if not download_index_tts_models():
-        print("Index-TTS模型下载未完全成功")
+    # 5. IndexTTS-2.5 权重：不在本脚本内处理，必须用专用脚本（ModelScope 源）
+    print("=" * 60)
+    print("提示：IndexTTS-2.5 权重请单独执行： python Download_indextts25.py")
+    print("=" * 60)
     
     print("=" * 60)
     print("所有模型下载任务已完成!")

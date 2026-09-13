@@ -20,48 +20,55 @@ AUDIO_FILE = os.path.join(project_root, "temp", "vocal_1_44100.wav")
 JSON_FILE = os.path.join(project_root, "results", "speaker_diarization.json")
 OUTPUT_DIR = os.path.join(project_root, "temp", "clips")
 
-def create_clips():
+def create_clips(audio_file=None, json_file=None, output_dir=None):
+    audio_file = audio_file or AUDIO_FILE
+    json_file = json_file or JSON_FILE
+    output_dir = output_dir or OUTPUT_DIR
+
     # 清空输出目录（如果已存在）
-    if os.path.exists(OUTPUT_DIR):
+    if os.path.exists(output_dir):
         import shutil
-        shutil.rmtree(OUTPUT_DIR)
-    
+        shutil.rmtree(output_dir)
+
     # 创建输出目录
-    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
-    
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
     # 读取说话人分离结果
-    with open(JSON_FILE, 'r', encoding='utf-8') as f:
+    with open(json_file, 'r', encoding='utf-8') as f:
         segments = json.load(f)
-    
+
     print(f"Found {len(segments)} segments")
-    
+    print(f"audio={audio_file}")
+    print(f"json={json_file}")
+    print(f"output_dir={output_dir}")
+
     # 按说话人分类存储
     speaker_counts = {}
-    
+
     for i, segment in enumerate(segments):
         start = segment['start']
         end = segment['end']
         speaker = segment['speaker']
         duration = segment['duration']
-        
+
         # 计算说话人的片段数量
         if speaker not in speaker_counts:
             speaker_counts[speaker] = 0
         speaker_counts[speaker] += 1
-        
+
         # 创建说话人子目录
-        speaker_dir = os.path.join(OUTPUT_DIR, speaker)
+        speaker_dir = os.path.join(output_dir, speaker)
         Path(speaker_dir).mkdir(parents=True, exist_ok=True)
-        
+
         # 输出文件名 (改为wav格式) 格式: clip_{说话人ID}_{序号}_{开始时间}-{结束时间}.wav
         # 提取说话人ID，例如 SPEAKER_01 -> s1
         speaker_id = speaker.split('_')[1].lower().replace('speaker', 's')
         output_file = os.path.join(speaker_dir, f"clip_{speaker_id}_{speaker_counts[speaker]:03d}_{start:.2f}-{end:.2f}.wav")
-        
+
         # 使用ffmpeg从音频文件中切割片段
         cmd = [
             'ffmpeg',
-            '-i', AUDIO_FILE,
+            '-i', audio_file,
             '-ss', str(start),
             '-to', str(end),
             '-c:a', 'pcm_s16le',  # WAV格式需要的编码
@@ -70,20 +77,29 @@ def create_clips():
             '-y',                 # 覆盖已存在文件
             output_file
         ]
-        
+
         print(f"Processing segment {i+1}/{len(segments)}: {output_file}")
-        
+
         try:
             subprocess.run(cmd, check=True, capture_output=True)
             print(f"  Successfully created: {output_file}")
         except subprocess.CalledProcessError as e:
             print(f"  Error: Cannot create {output_file}")
             print(f"  Error details: {e}")
-    
+
     print("\nProcessing completed!")
     print("Number of segments per speaker:")
     for speaker, count in speaker_counts.items():
         print(f"  {speaker}: {count} segments")
 
+
 if __name__ == "__main__":
-    create_clips()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="按说话人分离结果把音频切成片段")
+    parser.add_argument("--audio", default=AUDIO_FILE, help="源音频（默认 temp/vocal_1_44100.wav）")
+    parser.add_argument("--json", default=JSON_FILE, help="说话人 JSON（默认 results/speaker_diarization.json）")
+    parser.add_argument("--output-dir", default=OUTPUT_DIR, help="片段输出目录（默认 temp/clips）")
+    args = parser.parse_args()
+
+    create_clips(args.audio, args.json, args.output_dir)

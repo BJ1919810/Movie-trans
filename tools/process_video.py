@@ -65,30 +65,34 @@ def extract_audio_from_video(video_path, output_audio_path, sample_rate=44100):
 
 
 def main():
+    import argparse
+
     # Get the directory of this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
     # Get the parent directory (project root)
     project_root = os.path.dirname(script_dir)
-    
-    # Define output path (relative to project root)
-    audio_file = "./temp/output_audio.wav"
-    audio_path = os.path.join(project_root, audio_file)
-    
-    # Check if video file path is provided as command line argument
-    if len(sys.argv) > 1:
-        video_path = sys.argv[1]
-        # If relative path, make it absolute
-        if not os.path.isabs(video_path):
-            video_path = os.path.join(os.getcwd(), video_path)
-    else:
-        # Default to ./1.mp4 if no argument provided (relative to project root)
-        video_file = "./1.mp4"
-        video_path = os.path.join(project_root, video_file)
-    
+
+    parser = argparse.ArgumentParser(description="用 ffmpeg 从视频中抽取音频（44.1kHz 立体声 WAV）")
+    parser.add_argument("video", nargs="?", default="./1.mp4",
+                        help="输入视频路径（默认 <项目根>/1.mp4）")
+    parser.add_argument("--output-dir", default=None,
+                        help="音频输出目录（默认 <项目根>/temp）")
+    parser.add_argument("--sample-rate", type=int, default=44100, help="输出采样率（默认 44100）")
+    args = parser.parse_args()
+
+    # 解析视频路径（相对路径按项目根解析，保持历史行为）
+    video_path = args.video
+    if not os.path.isabs(video_path):
+        video_path = os.path.join(project_root, video_path)
+
+    output_dir = args.output_dir or os.path.join(project_root, "temp")
+    os.makedirs(output_dir, exist_ok=True)
+    audio_path = os.path.join(output_dir, "output_audio.wav")
+
     try:
         # Process the video file
-        extract_audio_from_video(video_path, audio_path)
-        
+        extract_audio_from_video(video_path, audio_path, sample_rate=args.sample_rate)
+
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)

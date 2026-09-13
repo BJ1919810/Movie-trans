@@ -22,12 +22,14 @@ IndexTTS-2.5 里这两件事是**两条独立通道**：
 TTS_EMO_MODE=text 时按本句文本实时推断，每句都可以不一样。
 
 环境变量：
-  SPK_REF_MODE=fixed|segment   音色参考音频策略（默认 fixed）
-      fixed   : 每个说话人固定用一段参考音频 -> 缓存命中，快且音色稳定（推荐）
-      segment : 每段用它自己那段切片 -> 每段重算 embedding，慢，音色会漂移
+  SPK_REF_MODE=segment|fixed   音色参考音频策略（默认 segment）
+      segment : 每段用自己那段原片切片 —— 同声配音的正确解（推荐）
+                同一说话人在全片的麦位/音量/表演状态都在变，
+                音色与情绪都必须逐段跟随原声，否则整体跑偏。
+      fixed   : 每个说话人固定用一段参考音频（缓存命中、更快），
+                代价是音色/情绪偏离该段原声，仅在素材质量均匀时作提速近似。
   TTS_SORT_BY_SPEAKER=true|false  按说话人分组处理（默认 true）
-      让同一说话人的片段连续合成，缓存只需失效 N(说话人) 次而非 N(片段) 次。
-      输出文件名与顺序无关，结果完全一致。
+      仅对 fixed 模式有缓存收益（segment 模式下每段参考都不同）。
   TTS_EMO_MODE=text|ref|vector|none  情绪策略（默认 ref）
       ref    : 用当段原切片作为情绪参考（情绪跟着原片演员的表演走）
                *** 电影配音的推荐模式 ***
@@ -43,6 +45,8 @@ TTS_EMO_MODE=text 时按本句文本实时推断，每句都可以不一样。
   TTS_EMO_VECTOR=0,0,0,0,0,0,0,1   TTS_EMO_MODE=vector 时的 8 维向量
   TTS_LANG=ZH|EN|JA|ES|AR  合成语言（默认 ZH）
   TTS_DURATION_FACTOR=0.5~2.0  语速，>1 变慢、<1 变快（默认 1.0）
+  TTS_MAX_MEL_TOKENS=1~1815  单段生成长度上限（默认 1815 = 2.5 上限）
+      调小会**静默截断**较长台词（话说一半），除非明确知道原因否则别动。
 """
 
 import os
@@ -80,11 +84,15 @@ def _env_bool(name, default=False):
     return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
 # --- 音色参考音频策略 -----------------------------------------------------
-# fixed: 每个说话人固定一段（缓存命中，音色稳定）；segment: 每段用自己的切片（旧行为）
-SPK_REF_MODE = os.environ.get("SPK_REF_MODE", "fixed").strip().lower()
+# 本项目是**同声配音**：每段译文都对应一段原片切片，音色与情绪都应当参考
+# "那一段自己"——同一说话人在全片里的麦位、音量、表演状态都在变，
+# 用固定 clip 会同时偏离该段的音色与情绪。
+#   segment（默认，配音正确解）: 每段用自己那段切片
+#   fixed  （仅提速的近似解）  : 每个说话人固定一段，缓存命中率高但音色/情绪会漂移
+SPK_REF_MODE = os.environ.get("SPK_REF_MODE", "segment").strip().lower()
 if SPK_REF_MODE not in ("fixed", "segment"):
-    print(f"!! 未知的 SPK_REF_MODE={SPK_REF_MODE}，回退到 fixed")
-    SPK_REF_MODE = "fixed"
+    print(f"!! 未知的 SPK_REF_MODE={SPK_REF_MODE}，回退到 segment")
+    SPK_REF_MODE = "segment"
 
 # 按说话人分组处理，最大化 spk embedding 缓存命中
 SORT_BY_SPEAKER = _env_bool("TTS_SORT_BY_SPEAKER", True)
@@ -111,36 +119,45 @@ if TTS_EMO_MODE == "vector":
         print("!! 未设置 TTS_EMO_VECTOR，回退到 ref 模式")
         TTS_EMO_MODE = "ref"
 
-# IndexTTS-2.5（多语言）；设置 INDEXTTS_VERSION=2 可回退到旧的 IndexTTS-2 推理器
-if os.environ.get("INDEXTTS_VERSION", "2.5") == "2":
-    from indextts.infer_v2 import IndexTTS2
-else:
-    from indextts.infer_v2_5 import IndexTTS2
+# --- 单段音频长度上限 -------------------------------------------------------
+# max_mel_tokens 决定单次推理最多生成多少个 mel token（约等于音频长度上限）。
+# 2.5 的实现上限是 1815；用 1000 时稍长的台词会被**静默截断**（话说一半没了），
+# 所以这里默认拉到上限 1815，正常句子根本到不了，长句才有救。
+try:
+    TTS_MAX_MEL_TOKENS = int(os.environ.get("TTS_MAX_MEL_TOKENS", "1815"))
+except ValueError:
+    print("!! TTS_MAX_MEL_TOKENS 不是整数，回退到 1815")
+    TTS_MAX_MEL_TOKENS = 1815
+TTS_MAX_MEL_TOKENS = max(1, min(TTS_MAX_MEL_TOKENS, 1815))  # 超上限会被模型拒绝
 
-USE_V25 = os.environ.get("INDEXTTS_VERSION", "2.5") != "2"
+# IndexTTS-2.5（多语言）；v2 推理器已淘汰，本项目只走 infer_v2_5
+from indextts.infer_v2_5 import IndexTTS2
+
+# ---------------------------------------------------------------------------
+# 线性合成：本脚本必须**单进程**运行。
+# 8GB 卡上同时跑两个 TTS 进程不会抛 CUDA OOM，而是静默降级——
+# 输出电平比正常低约 20dB、部分分段是数字静音，听感即"严重失真的噪声"。
+# 因此运行前请确认没有其他实例（本脚本 / webui / real-time 服务）在占用显存。
+# ---------------------------------------------------------------------------
 
 # 初始化模型，启用多种性能优化选项
 # 强制使用CUDA，不回退到CPU模式
 init_kwargs = dict(
     cfg_path=os.path.join(project_root, "index-tts", "checkpoints", "config.yaml"),
     model_dir=os.path.join(project_root, "index-tts", "checkpoints"),
-    use_cuda_kernel=True,   # 使用自定义的CUDA内核来加速BigVGAN的推理
+    use_cuda_kernel=True,   # 使用自定义的CUDA内核来加速BigVGAN的推理（加载失败会自动回退 torch 实现）
     use_deepspeed=False,    # 暂时不启用DeepSpeed，因为它可能在某些系统上导致性能下降
     use_accel=False,         # 启用加速引擎来优化GPT模型的推理
     use_torch_compile=False, # 使用torch.compile来进一步优化模型执行
-    device="cuda:0"         # 强制使用CUDA设备
-)
-if USE_V25:
+    device="cuda:0",         # 强制使用CUDA设备
     # 2.5 默认使用 bf16（显存更省、数值更稳）
-    init_kwargs["use_bf16"] = True
+    use_bf16=True,
     # Qwen 情感模型：TTS_EMO_MODE=text 时必须加载，否则 use_emo_text 会直接 RuntimeError
-    init_kwargs["use_qwen_emo"] = _env_bool("USE_QWEN_EMO", False) or (USE_V25 and TTS_EMO_MODE == "text")
-else:
-    init_kwargs["use_fp16"] = True
-    init_kwargs["use_qwen_emo"] = _env_bool("USE_QWEN_EMO", False) or TTS_EMO_MODE == "text"
+    use_qwen_emo=_env_bool("USE_QWEN_EMO", False) or TTS_EMO_MODE == "text",
+)
 
 tts = IndexTTS2(**init_kwargs)
-print(f"Model initialized with CUDA kernel support. (IndexTTS-{'2.5' if USE_V25 else '2'}, lang={TTS_LANG})")
+print("Model initialized with CUDA kernel support. (IndexTTS-2.5, lang=%s)" % TTS_LANG)
 
 # 输出目录（使用相对路径）
 output_dir = os.path.join(project_root, "results", "tts_output")
@@ -176,8 +193,13 @@ for speaker in speaker_dirs:
             ref_audio_files[f"{speaker}_{start_s:.2f}-{end_s:.2f}"] = file_path
 
 # ---------------------------------------------------------------------------
-# 为每个说话人挑一段"固定音色参考音频"（SPK_REF_MODE=fixed）
-# 挑选策略（推理侧 _load_and_cut_audio 会把参考截取到 15 秒，所以超长片段也合法）：
+# 音色参考音频（SPK_REF_MODE）
+#   segment（默认）: 音色参考=本段自己的原片切片 —— 同声配音的正确解。
+#                    同一说话人在全片的麦位/音量/表演状态都在变，
+#                    逐段跟随才不会让音色和情绪跑偏。
+#   fixed（可选）  : 每说话人挑一段固定参考，缓存命中、更快，
+#                    代价是音色与情绪偏离该段原声（仅作提速近似）。
+# 挑选策略（fixed 时；推理侧 _load_and_cut_audio 会把参考截到 15 秒，超长片段也合法）：
 #   1) 3~15s 里最接近 8 秒的（理想区间）
 #   2) >=15s 的（截断后等效 15s，信息量最大）
 #   3) 0~15s 里最长的
@@ -195,24 +217,27 @@ def _clip_duration(path):
     return max(0.0, float(m.group(2)) - float(m.group(1)))
 
 
-for speaker in speaker_dirs:
-    cand = [p for p in glob.glob(os.path.join(project_root, "temp", "clips", f"{speaker}/*.wav"))]
-    if not cand:
-        continue
-    ideal = [p for p in cand if 3.0 <= _clip_duration(p) <= 15.0]
-    if ideal:
-        best = min(ideal, key=lambda p: abs(_clip_duration(p) - TARGET_REF_SEC))
-    else:
-        longs = [p for p in cand if _clip_duration(p) >= 15.0]
-        shorts = [p for p in cand if 0 < _clip_duration(p) < 15.0]
-        if longs:
-            best = min(longs, key=lambda p: _clip_duration(p))  # 越接近 15s 越好
-        elif shorts:
-            best = max(shorts, key=_clip_duration)
+if SPK_REF_MODE == "fixed":
+    for speaker in speaker_dirs:
+        cand = [p for p in glob.glob(os.path.join(project_root, "temp", "clips", f"{speaker}/*.wav"))]
+        if not cand:
+            continue
+        ideal = [p for p in cand if 3.0 <= _clip_duration(p) <= 15.0]
+        if ideal:
+            best = min(ideal, key=lambda p: abs(_clip_duration(p) - TARGET_REF_SEC))
         else:
-            best = cand[0]
-    speaker_fixed_ref[speaker] = best
-    print(f"[音色参考] {speaker} -> {os.path.basename(best)} ({_clip_duration(best):.2f}s)")
+            longs = [p for p in cand if _clip_duration(p) >= 15.0]
+            shorts = [p for p in cand if 0 < _clip_duration(p) < 15.0]
+            if longs:
+                best = min(longs, key=lambda p: _clip_duration(p))  # 越接近 15s 越好
+            elif shorts:
+                best = max(shorts, key=_clip_duration)
+            else:
+                best = cand[0]
+        speaker_fixed_ref[speaker] = best
+        print(f"[音色参考·fixed] {speaker} -> {os.path.basename(best)} ({_clip_duration(best):.2f}s)")
+else:
+    print("[音色参考·segment] 每段使用自身原片切片（同声配音：音色+情绪逐段跟随原声）")
 
 # ---------------------------------------------------------------------------
 # 情绪参数构造（与音色参考音频完全解耦）
@@ -230,7 +255,7 @@ def build_emo_kwargs(segment_ref_path):
     return dict()  # none：不显式控制，走默认（参考音频自带情绪）
 
 
-# 按说话人分组，让 spk embedding 缓存尽可能少失效（输出文件名与顺序无关）
+# 按说话人分组（仅 fixed 模式对缓存有意义；segment 模式下每段参考都不同）
 if SORT_BY_SPEAKER:
     order = sorted(range(len(segments)), key=lambda i: segments[i]["speaker"])
 else:
@@ -276,7 +301,7 @@ for i in order:
         output_path=output_path,
         verbose=True,
         # 性能优化参数
-        max_mel_tokens=1000,  # 控制最大mel token数量
+        max_mel_tokens=TTS_MAX_MEL_TOKENS,  # 2.5 上限 1815（默认），避免长句被截断
         do_sample=True,
         top_p=0.8,
         top_k=15,
@@ -286,10 +311,9 @@ for i in order:
         max_text_tokens_per_segment=120
     )
     infer_kwargs.update(build_emo_kwargs(seg_ref_path))
-    if USE_V25:
-        # 2.5 需要显式指定语言（日语用 JA）；duration_factor 控制语速，>1 变慢、<1 变快
-        infer_kwargs["lang"] = TTS_LANG
-        infer_kwargs["duration_factor"] = float(os.environ.get("TTS_DURATION_FACTOR", "1.0"))
+    # 2.5 需要显式指定语言（日语用 JA）；duration_factor 控制语速，>1 变慢、<1 变快
+    infer_kwargs["lang"] = TTS_LANG
+    infer_kwargs["duration_factor"] = float(os.environ.get("TTS_DURATION_FACTOR", "1.0"))
     tts.infer(**infer_kwargs)
 
     print(f"Speech saved to: {output_path}\n")

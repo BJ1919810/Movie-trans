@@ -119,4 +119,32 @@ def denoise_audio():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="UVR5 人声/伴奏分离（HP2_all_vocals）")
+    parser.add_argument("--input", default=input_audio_path,
+                        help="输入音频路径（默认 <项目根>/temp/output_audio.wav）")
+    parser.add_argument("--output-dir", default=None,
+                        help="输出目录（默认 <项目根>/temp）")
+    parser.add_argument("--model-name", default=model_name, help="UVR5 模型名（默认 HP2_all_vocals）")
+    parser.add_argument("--agg", type=int, default=agg, help="人声提取激进程度（默认 10）")
+    parser.add_argument("--fp16", action="store_true", help="启用半精度推理（默认关闭）")
+    args = parser.parse_args()
+
+    input_audio_path = os.path.abspath(args.input)
+    if not os.path.isfile(input_audio_path):
+        print(f"Error: input audio not found: {input_audio_path}")
+        sys.exit(1)
+
+    out_dir = os.path.abspath(args.output_dir) if args.output_dir else os.path.join(project_path, "temp")
+    os.makedirs(out_dir, exist_ok=True)
+    output_vocal_path = out_dir
+    output_ins_path = out_dir
+    model_name = args.model_name
+    agg = args.agg
+    is_half = bool(args.fp16)
+
+    print(f"input={input_audio_path}")
+    print(f"output_dir={out_dir} model={model_name} agg={agg} fp16={is_half}")
+
     denoise_audio()

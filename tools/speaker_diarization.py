@@ -73,7 +73,8 @@ def check_and_download_model(repo_id, filename, local_path):
         print(f"Model file already exists: {local_path}")
         return True
 
-def run_speaker_diarization(audio_file, output_file=None):
+def run_speaker_diarization(audio_file, output_file=None, cluster_threshold=0.72,
+                            min_cluster_size=15, min_duration_off=0):
     try:
         print("Initializing pyannote speaker diarization pipeline...")
         
@@ -126,15 +127,16 @@ def run_speaker_diarization(audio_file, output_file=None):
         'ward': 5,      # Ward方差最小化 → 对球形簇极佳
         'weighted': 6   # 加权平均
         '''
-        # 使用默认参数配置
+        # 聚类参数由调用方传入（WebUI 可调）：threshold 越高说话人越少，
+        # min_cluster_size 越小越容易把短促的插话单独分成一个说话人
         params = {
             "segmentation": {
-                "min_duration_off": 0
+                "min_duration_off": min_duration_off
             },
             "clustering": {
                 "method": "average",
-                "threshold": 0.72,  # 值越高，speaker数量越小
-                "min_cluster_size": 15  # 小于该值的小cluster会被归为附近的大cluster里
+                "threshold": cluster_threshold,  # 值越高，speaker数量越小
+                "min_cluster_size": min_cluster_size  # 小于该值的小cluster会被归为附近的大cluster里
             }
         }
         
@@ -227,6 +229,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run speaker diarization on an audio file")
     parser.add_argument("--audio", type=str, help="Path to the input audio file")
     parser.add_argument("--output", type=str, help="Path to the output JSON file")
+    parser.add_argument("--threshold", type=float, default=0.72,
+                        help="聚类阈值，越高说话人越少（默认 0.72）")
+    parser.add_argument("--min-cluster-size", type=int, default=15,
+                        help="最小簇大小，越小越容易分出短促插话的说话人（默认 15）")
+    parser.add_argument("--min-duration-off", type=float, default=0,
+                        help="静音/间隙处理阈值（默认 0 = 不填充间隙）")
     
     # 解析命令行参数
     args = parser.parse_args()
@@ -235,7 +243,12 @@ if __name__ == "__main__":
     audio_file = args.audio if args.audio else os.path.join(project_root, "temp", "vocal_1_16000.wav")
     output_file = args.output if args.output else os.path.join(project_root, "results", "speaker_diarization.json")
     
-    json_file = run_speaker_diarization(audio_file, output_file)
+    json_file = run_speaker_diarization(
+        audio_file, output_file,
+        cluster_threshold=args.threshold,
+        min_cluster_size=args.min_cluster_size,
+        min_duration_off=args.min_duration_off,
+    )
     if json_file:
         print(f"\nProcess completed successfully. Results saved to {json_file}")
     else:
