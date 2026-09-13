@@ -1,190 +1,182 @@
-# Movie-trans - Real-time and File-based Speech Translation System
+# Movie-trans — Movie Dubbing Translation & Real-time Speech Translation
 
-A versatile translation system supporting both file-based movie translation and real-time voice translation (demo mode), with advanced AI-powered features including speaker diarization, automatic speech recognition, large language model translation, and text-to-speech synthesis.
+An end-to-end video dubbing pipeline: video → vocal isolation → speaker diarization → ASR → LLM translation → TTS dubbing → remux back into video.
+Powered by **IndexTTS-2.5** (voice cloning + emotion control, supporting ZH/EN/JA/ES/AR), with a real-time translation demo included.
 
 ## Features
 
-### File Translation Pipeline
-- **Video Processing**: Extract audio from video files with synchronized timestamps
-- **Audio Enhancement**: Denoise and isolate vocals using UVR5 technology
-- **Speaker Diarization**: Identify and separate different speakers
-- **Automatic Speech Recognition (ASR)**: Support for multiple languages (Chinese, English, Japanese, etc.)
-- **Machine Translation**: High-quality text translation using DeepSeek API
-- **Text-to-Speech (TTS)**: Natural-sounding voice synthesis preserving original speaker characteristics
-- **Annotation Interface**: Web-based UI for reviewing and editing translation results
+### File Translation Pipeline (main)
+- **Video processing**: audio extraction with timestamp alignment throughout
+- **Audio enhancement**: UVR5 vocal isolation / denoising
+- **Speaker diarization**: multi-speaker separation with pyannote
+- **ASR**: FunASR (Chinese) / Faster-Whisper (multilingual)
+- **Machine translation**: DeepSeek API (target language: zh / en / ja)
+- **TTS dubbing**: IndexTTS-2.5 voice cloning, 5 languages (`ZH / EN / JA / ES / AR`)
+  - **Timbre / emotion decoupling**: fixed per-speaker reference audio (embedding cache hits, fast and stable); emotion follows the original clip's prosody by default
+  - Emotion sources: original-audio reference / QwenEmotion text inference / 8-dim emotion vector
+  - Speaking-rate control (`duration_factor`), Japanese G2P via fugashi
+- **Remux**: merge dubbed speech back into the original video, optional subtitles
+- **Web UI**: Gradio app wiring the whole pipeline together, with live-streaming TTS logs
 
 ### Real-time Translation (Demo)
-- **Live Audio Capture**: Real-time audio processing using WASAPI loopback capture
-- **Streaming ASR**: Low-latency speech recognition
-- **Instant Translation**: Real-time text translation
-- **Synchronized TTS**: Real-time voice synthesis matching original speaker's tone
-- **Bilingual Subtitles**: Real-time bilingual subtitles display with original and translated text
+- WASAPI loopback capture → streaming ASR → live translation → synchronized TTS + bilingual subtitles (Windows, .NET client + Python backend)
 
 ## Project Structure
 
 ```
 Movie-trans/
-├── main.py              # Main file translation pipeline with Gradio UI
-├── real-time/           # Real-time translation demo
-│   ├── Program.cs       # .NET audio capture and streaming client
-│   └── model_server_streaming.py  # Python backend for real-time processing
-├── asr/                 # Automatic Speech Recognition models and utilities
-├── tools/               # Pipeline processing tools
-│   ├── process_video.py    # Video to audio conversion
-│   ├── denoise.py          # Audio denoising
-│   ├── speaker_diarization.py  # Speaker separation
-│   ├── merge_speaker_segments.py  # Merge adjacent segments
-│   ├── test_clips.py      # Create audio clips from segments
-│   ├── asr.py            # ASR processing
-│   └── annotate.py       # Web-based annotation interface
-├── index-tts/           # Text-to-Speech system with voice cloning
-├── temp/                # Temporary processing directory
-└── results/             # Output directory
+├── main.py                  # Main pipeline (Gradio UI)
+├── env_config.py            # .env loader (no third-party deps)
+├── .env.example             # API key template (copy to .env)
+├── Download_indextts25.py   # IndexTTS-2.5 weights downloader (ModelScope)
+├── Download_models.py       # ASR / pyannote / auxiliary models (HuggingFace)
+├── tools/                   # Pipeline stage scripts
+│   ├── process_video.py     #   video → audio
+│   ├── denoise.py           #   UVR5 vocal isolation
+│   ├── speaker_diarization.py  # speaker separation
+│   ├── merge_speaker_segments.py  # merge adjacent segments
+│   ├── test_clips.py        #   reference-clip extraction
+│   ├── asr.py               #   ASR
+│   ├── translate.py         #   LLM translation
+│   ├── batch_tts.py         #   batch TTS (language/emotion/timbre policies)
+│   ├── merge_tts_video_improved.py  # remux dubbed audio into video
+│   └── annotate.py          #   web annotation UI
+├── asr/                     # ASR wrappers (FunASR / Faster-Whisper)
+├── uvr5/                    # UVR5 vocal separation (weights downloaded separately)
+├── index-tts/               # IndexTTS-2.5 source (vendored with local patches)
+├── real-time/               # Real-time demo (.NET client + Python backend)
+├── temp/                    # Intermediate artifacts (generated at runtime)
+└── results/                 # Output directory
 ```
 
 ## Installation
 
 ### Prerequisites
-- Python 3.8+
-- .NET 9.0.300+ SDK (for real-time demo)
-- CUDA-capable GPU recommended (for faster processing)
+- Python 3.10+ (3.12 recommended)
+- CUDA GPU (strongly recommended)
+- .NET 9 SDK (real-time demo only)
+- ffmpeg
 
-### Dependencies Installation
+### 1. Install dependencies
 
-1. Install Python dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-2. For real-time translation demo:
-```bash
-# Download and install .NET SDK 9.0.300 from https://dotnet.microsoft.com/download/dotnet/9.0
-# After installation, verify it works:
-dotnet --version
+### 2. Configure API keys
 
-# Then restore .NET project dependencies
-cd real-time
-dotnet restore
+```bash
+cp .env.example .env
+# Edit .env:
+#   DEEPSEEK_API_KEY  — translation (https://platform.deepseek.com/)
+#   HF_TOKEN          — pyannote model download (https://huggingface.co/settings/tokens)
 ```
 
-3. Download required models (**Note**: If downloads fail, check network connection or proxy settings):
-   - **ASR models**: Automatically downloaded on first run
-   - **index-tts models**:
-     1. Clone the project from GitHub to the specified directory:
-        ```bash
-        cd d:\0Coding\pythonworkspace\My_program\Movie-trans
-        git clone https://github.com/index-tts/index-tts.git
-        ```
-     2. Carefully read the index-tts official instructions and download required model files from Hugging Face or other platforms
-   - **pyannote models**:
-     1. Visit model pages and accept authorization:
-        - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-        - [pyannote/wespeaker-voxceleb-resnet34-LM](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM)
-     2. Log in to Hugging Face and create an access token with model read permissions
-     3. Modify the following content in `tools/speaker_diarization.py`:
-        ```python
-        # Set HF access token as environment variable
-        HF_TOKEN = "YOUR_HF_TOKEN"  # Replace with your Hugging Face token
-        os.environ["HF_TOKEN"] = HF_TOKEN
-        
-        # Comment out offline mode setting
-        # os.environ["HF_HUB_OFFLINE"] = "1"
-        ```
-     4. You can re-enable offline mode after first run
+### 3. Download models
+
+**IndexTTS-2.5 weights** (via ModelScope, ~5.5 GB):
+
+```bash
+python Download_indextts25.py
+```
+
+The script verifies file sizes, so re-running it after an interruption resumes/repairs incomplete downloads.
+
+**ASR / pyannote models** (via HuggingFace; set `HF_TOKEN` in `.env` first):
+
+```bash
+python Download_models.py
+```
+
+UVR5 weights ship with the repo (`uvr5/uvr5_weights/`, HP2-all-vocals); FunASR models auto-download on first run.
 
 ## Usage
 
-### File Translation
+### File translation
 
-1. Start the main application:
 ```bash
 python main.py
 ```
 
-2. The Gradio web interface will open in your browser.
+A Gradio UI opens in your browser with four tabs following the pipeline:
 
-3. Follow the pipeline steps:
-   - **Upload Video**: Select a video file to process
-   - **Denoise Audio**: Enhance audio quality and isolate vocals
-   - **ASR Processing**: Recognize speech and perform speaker diarization
-   - **Annotation**: Review and edit transcriptions (optional)
-   - **Translation**: Translate text to target language
-   - **TTS Synthesis**: Generate translated speech
-   - **Integrate Video**: Merge the translated voice with the original video, and choose whether to add subtitles and adjust the format
+① Extract & Denoise → ② ASR & Segmentation → ③ Translate & Annotate → ④ TTS & Mux.
+Each tab has a collapsed **⚙️ advanced section** (denoise model/aggressiveness, diarization
+clustering, segment granularity, ASR device/precision, TTS voice strategy / emotion strength /
+length cap, per-segment alignment, ...). All are pre-set to the recommended values — leave them
+alone unless you know why you are changing them. The parameters you actually touch are up front.
 
-### Real-time Translation (Demo)
+The **annotation page** (launched from tab ③) lets you edit both `raw_text` and `result_text`
+side by side, A/B listen against the synthesized TTS of that segment, see speaker / start / end /
+duration per row, and split or merge segments. Submitting or paging writes back to the JSON automatically.
 
-1. Start the Python backend server:
+TTS options are built into the UI (language / emotion source / speaking rate). You can also run `tools/batch_tts.py` directly with environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `TTS_LANG` | `ZH` | Synthesis language: `ZH / EN / JA / ES / AR` |
+| `SPK_REF_MODE` | `segment` | Timbre reference: `segment` per-segment original clip (correct for dubbing, recommended) / `fixed` one clip per speaker (faster but timbre/emotion drift) |
+| `TTS_EMO_MODE` | `ref` | Emotion source: `ref` follow original performance (dubbing) / `text` QwenEmotion inference (audiobooks) / `vector` / `none` |
+| `TTS_EMO_ALPHA` | `1.0` | Emotion intensity |
+| `TTS_EMO_VECTOR` | — | 8-dim emotion vector for `vector` mode (comma-separated) |
+| `TTS_DURATION_FACTOR` | `1.0` | Speaking rate: >1 slower, <1 faster |
+| `TTS_MAX_MEL_TOKENS` | `1815` | Max generation length per segment (1815 = the 2.5 ceiling). Lower values **silently truncate** longer lines |
+| `USE_QWEN_EMO` | `false` | Load the Qwen emotion model (required by `text` mode) |
+
+**Per-segment alignment** options for the remux step (`tools/merge_tts_video_improved.py`) — TTS duration
+rarely matches the original segment exactly, which leaves gaps or bleeds into the next line, so each segment
+is time-stretched to its original length with atempo (pitch preserved):
+
+| Variable | Default | Description |
+|---|---|---|
+| `ALIGN_TTS` | `true` | Enable per-segment duration alignment |
+| `ALIGN_MAX_RATE` | `1.25` | Max stretch factor (speaking rate changes at most ±25%) |
+| `ALIGN_MIN_DEV` | `0.05` | Deviation threshold; anything under 5% is left untouched |
+| `ALIGN_TRIM_OVERFLOW` | `false` | Trim segments that are still too long; when `false` they are only reported in a summary |
+| `TTS_FADE_MS` | `15` | Fade in/out per segment (ms) to avoid hard-cut clicks |
+| `TTS_LOUDNESS_MATCH` | `true` | Match each segment's loudness to **the RMS of its own original clip** (peak ≠ loudness: the old peak-normalize made dense/boomy segments ~10 dB louder for free) |
+| `TTS_LOUDNESS_OFFSET` | `0.0` | Extra offset (dB) applied after matching; use a positive value for an overall louder dub |
+| `TTS_PEAK_CEIL` | `-1.0` | Peak ceiling (dBFS); anything above is pulled down to avoid mix clipping |
+| `TTS_MIN_RMS` | `-30.0` | Lower bound for the target loudness (dBFS), so very quiet originals don't become inaudible |
+| `OUTPUT_SR` | `44100` | Output audio sample rate. **Do not remove or change lightly**: without an explicit `-ar`, ffmpeg's loudnorm writes its output at 192 kHz, and since the AAC encoder caps at 96 kHz the film ends up with an unusual 96 kHz track (measured 3.1 dB worse SNR at the same bitrate) |
+
+Loudness normalization (`loudnorm I=-16:TP=-1.5:LRA=11`) runs **once** before muxing and is not repeated during
+muxing, so the dynamics are not reshaped twice.
+
+### Real-time translation (Demo)
+
 ```bash
 cd real-time
-python model_server_streaming.py
+python model_server_streaming.py   # terminal 1: Python backend
+dotnet run                         # terminal 2: .NET client
 ```
-
-2. In another terminal, start the .NET client:
-```bash
-cd real-time
-dotnet run
-```
-
-3. The system will automatically capture audio, process it in real-time, and output translated speech.
 
 ## Technical Details
 
-### ASR Models
-- **FunASR**: Chinese speech recognition with VAD and punctuation
-- **Faster-Whisper**: Multi-language support (English, Japanese, etc.)
+- **ASR**: FunASR Paraformer (zh, VAD + punctuation) / Faster-Whisper large-v3 (multilingual)
+- **Diarization**: pyannote segmentation-3.0 + wespeaker
+- **Vocal isolation**: UVR5 (MDX-Net / BS-Roformer)
+- **Translation**: DeepSeek Chat API
+- **TTS**: [IndexTTS-2.5](https://github.com/index-tts/index-tts) (IndexTeam) with BigVGAN vocoder; multilingual tiktoken tokenizer, Japanese readings via fugashi G2P
 
-### Audio Processing
-- **UVR5**: AI-powered vocal isolation
-- **Librosa**: Audio resampling and manipulation
+## Troubleshooting
 
-### Translation
-- **DeepSeek API**: High-quality neural machine translation
-
-### TTS
-- **IndexTTS**: Advanced text-to-speech with voice cloning capabilities
-- **BigVGAN**: High-fidelity audio synthesis
-
-## Configuration
-
-### API Keys
-Edit the API key in `main.py` and `real-time/model_server_streaming.py`:
-```python
-DEEPSEEK_API_KEY = "your-api-key-here"
-```
-If you do not want to use DeepSeek's API or wish to utilize the API of other large language models, you can modify the relevant code in `main.py` and `real-time/model_server_streaming.py`.
-
-### Model Paths
-Configure custom model paths in the respective configuration files:
-- ASR models: `asr/models/`
-- TTS models: `index-tts/checkpoints/`
-
-## Performance Considerations
-
-- **GPU Acceleration**: Enable CUDA for significant speed improvements
-- **Batch Processing**: File translation processes segments in batches for efficiency
-- **Real-time Latency**: Demo mode may have noticeable latency depending on hardware
-
-## Limitations
-
-- Real-time translation is currently in demo mode with limited accuracy
-- Processing time depends on video length and hardware capabilities
-- Internet connection required for DeepSeek API translation
+- **TTS output is noise / very quiet and muddy (the nasty one)**: you almost certainly have **two TTS processes running at once**. On an 8 GB GPU, concurrent runs do **not** raise a CUDA OOM — they silently degrade: output sits ~20 dB below normal and some segments come out as digital silence, which sounds like "severe distortion". Re-running the same text as a single process produces 24/24 normal segments. So always run TTS **as a single, sequential process**: before batch synthesis, make sure nothing else is holding VRAM (`batch_tts`, the `main.py` UI, and the `real-time/` service are mutually exclusive).
+- **Which reference clip is used**: this project does simultaneous dubbing, so `SPK_REF_MODE=segment` by default — every segment uses **its own original clip** for both timbre and emotion, tracking that segment's mic position, loudness and performance. `fixed` (one clip per speaker) is a speed-only approximation that drifts from the original.
+- **bigvgan CUDA kernel fails to load (`Ninja is required`)**: expected — it falls back to the torch implementation with no quality loss (just slightly slower).
+- **transformers ImportError in TTS**: this repo pins `transformers==4.52.1` + `huggingface_hub==0.34.4` — do not upgrade (5.x removed APIs IndexTTS depends on).
+- **Crash on startup with tensorflow installed**: this project does not need TensorFlow; run `pip uninstall tensorflow`.
+- **Out of VRAM**: the 2.5 inferencer defaults to bf16; enable the Qwen emotion model (~1.2 GB) only when needed.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+MIT License — see [LICENSE](LICENSE). The `index-tts/` subdirectory follows the upstream IndexTTS license.
 
 ## Acknowledgments
 
-- PyAnnote for speaker diarization
-- FunASR and Whisper for speech recognition
-- DeepSeek for translation API
-- IndexTTS for voice synthesis
-- UVR5 for vocal isolation
-
-
+- [IndexTTS](https://github.com/index-tts/index-tts) (IndexTeam @ Bilibili) — speech synthesis
+- [FunASR](https://github.com/modelscope/FunASR), [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) — ASR
+- [pyannote-audio](https://github.com/pyannote/pyannote-audio) — speaker diarization
+- [UVR5](https://github.com/Anjok07/ultimatevocalremovergui) — vocal isolation
+- [DeepSeek](https://www.deepseek.com/) — translation API
+- [ModelScope](https://www.modelscope.cn/) — model hosting
