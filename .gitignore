@@ -1,0 +1,40 @@
+# ==================== 模型与权重（用 Download_*.py 下载）====================
+# IndexTTS-2.5 权重（python Download_indextts25.py）
+index-tts/checkpoints/
+# ASR / pyannote 模型（python Download_models.py 或首次运行自动下载）
+asr/models/
+# UVR5 权重：HP2_all_vocals.pth 随仓库提供，其余权重如需可另行下载
+# 根目录 hf_cache（辅助模型缓存）
+checkpoints/
+# BigVGAN CUDA 扩展构建产物
+index-tts/indextts/s2mel/modules/bigvgan/alias_free_activation/cuda/build/
+# NeMo 文本正规化 tagger 缓存（运行时生成）
+index-tts/indextts/utils/tagger_cache/
+
+# ==================== 密钥 ====================
+.env
+
+# ==================== 运行时产物 ====================
+temp/*
+!temp/.gitkeep
+results/*
+!results/.gitkeep
+1.mp4
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ==================== .NET ====================
+real-time/bin/
+real-time/obj/
+
+# ==================== IDE / 系统 ====================
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
