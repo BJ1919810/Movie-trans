@@ -128,14 +128,6 @@ dotnet run
 
 3. The system will automatically capture audio, process it in real-time, and output translated speech.
 
-## Demos
-
-The `examples/` directory contains demo videos:
-
-- `English-raw.mp4` — original clip
-- `Chinese-result.mp4` — translated & dubbed result
-- `live-demo.mp4` — real-time translation demo recording
-
 ## Technical Details
 
 ### ASR Models

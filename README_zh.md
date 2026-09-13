@@ -121,6 +121,14 @@ python model_server_streaming.py   # 终端 1：Python 后端
 dotnet run                         # 终端 2：.NET 客户端
 ```
 
+## 演示示例
+
+`examples/` 内含演示视频：
+
+- `English-raw.mp4` — 原片片段
+- `Chinese-result.mp4` — 翻译配音结果
+- `live-demo.mp4` — 实时翻译 Demo 录屏
+
 ## 技术细节
 
 - **ASR**：FunASR Paraformer（中，VAD+标点）/ Faster-Whisper large-v3（多语言）
