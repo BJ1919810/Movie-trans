@@ -1,6 +1,9 @@
 import os
 
-os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
+# [Movie-trans 本地改动] 缓存统一到 <index-tts>/checkpoints/hf_cache（原来是 CWD 相对的
+# './checkpoints/hf_cache'，会随启动目录漂移并造成重复下载）。
+os.environ['HF_HUB_CACHE'] = os.path.abspath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'checkpoints', 'hf_cache'))
 import time
 from subprocess import CalledProcessError
 from typing import Dict, List

@@ -82,13 +82,76 @@ python Download_indextts25.py
 
 The script verifies file sizes, so re-running it after an interruption resumes/repairs incomplete downloads.
 
-**ASR / pyannote models** (via HuggingFace; set `HF_TOKEN` in `.env` first):
+**ASR / pyannote models + IndexTTS auxiliary models** (via HuggingFace; set `HF_TOKEN` in `.env` first):
 
 ```bash
 python Download_models.py
 ```
 
-UVR5 weights ship with the repo (`uvr5/uvr5_weights/`, HP2-all-vocals); FunASR models auto-download on first run.
+#### Where models live (single canonical location — do not change)
+
+| Content | Location |
+|---|---|
+| IndexTTS-2.5 main weights (`gpt.pth` / `s2mel.pth` / `codec.pth` / `config.yaml` …) | `index-tts/checkpoints/` |
+| IndexTTS **auxiliary models**, flat layout (`w2v-bert-2.0/`, `bigvgan/`, `campplus_cn_common.bin`, `semantic_codec_model.safetensors`) | `index-tts/checkpoints/hf_cache/` |
+| ASR / pyannote / Whisper / FunASR | `asr/models/` |
+| Vocal-separation weights | `uvr5/uvr5_weights/` |
+
+Two rules:
+
+1. The **only** canonical location for auxiliary models is `index-tts/checkpoints/hf_cache/` — that is
+   `{model_dir}/hf_cache` as resolved by `ensure_models_available(model_dir)`, and it is what the runtime
+   actually reads. Both download scripts write there and skip anything already present.
+2. **Never download into `<project-root>/checkpoints/`.** That was a legacy second location holding a
+   duplicate copy of the same models (3.56 GB), removed on 2026-09-14 after a per-file `sha256` comparison
+   confirmed byte-identical content. No runtime code points there any more.
+
+UVR5 weights must be provided in `uvr5/uvr5_weights/`: the default `roformer` engine needs
+BS-Roformer (see below), the fallback `uvr5` engine needs `HP2_all_vocals.pth`.
+FunASR models auto-download on first run.
+
+### Vocal separation: two engines (BS-Roformer by default)
+
+`tools/denoise.py` supports two engines with identical output filenames, so nothing downstream changes:
+
+| `--engine` | Model | Weights | Quality / speed |
+|---|---|---|---|
+| **`roformer` (default)** | **BS-Roformer** `model_bs_roformer_ep_317_sdr_12.9755` | 610 MB (see below) | ~53 s for 121 s of audio on an RTX 3070. **Best in A/B listening**: least high-frequency residue, sibilance and breath preserved |
+| `uvr5` | VR arch `HP2_all_vocals` | 60 MB | Faster and smaller, but noticeably more residue on dialogue over loud BGM |
+
+```bash
+# roformer is the default — just run it
+python tools/denoise.py --input temp/output_audio.wav
+# switch back to the old engine
+python tools/denoise.py --input temp/output_audio.wav --engine uvr5 --model-name HP2_all_vocals
+```
+
+**Where to put the weights**: `uvr5/uvr5_weights/model_bs_roformer_ep_317_sdr_12.9755.ckpt` plus a
+same-named `.yaml`. The filename must contain `bs_roformer` (or `mel_band_roformer`) to be auto-detected.
+
+Download (`huggingface.co` is not directly reachable here — use the mirror):
+
+```bash
+# weights, 610MB
+curl -L -o uvr5/uvr5_weights/model_bs_roformer_ep_317_sdr_12.9755.ckpt \
+  "https://hf-mirror.com/Sucial/MSST-WebUI/resolve/main/All_Models/vocal_models/model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+# config
+curl -L -o uvr5/uvr5_weights/model_bs_roformer_ep_317_sdr_12.9755.yaml \
+  "https://raw.githubusercontent.com/TRvlvr/application_data/main/mdx_model_data/mdx_c_configs/model_bs_roformer_ep_317_sdr_12.9755.yaml"
+```
+
+Checksum (`sha256`): `5b84f37e8d444c8cb30c79d77f613a41c05868ff9c9ac6c7049c00aefae115aa`
+
+**Note**: the roformer engine **requires CUDA** (`uvr5/bsroformer.py` hardcodes `torch.amp.autocast("cuda")`)
+and defaults to half precision (`--fp32` disables it). `--agg` only applies to the uvr5 engine.
+
+> ⚠️ **Do not add "denoise / de-reverb / high-frequency cleanup" post-processing** (settled 2026-09-14).
+> Reason 1: denoise / de-reverb do **full-band reconstruction**, repainting the voice's harmonic tails and
+> room reverb together → the result sounds **dry**.
+> Reason 2: even a pure spectral-threshold variant ("only cut broadband residue exceeding the voice
+> envelope") fails — the `HF(3-10k)/voice-core` ratio **cannot separate birdsong from ordinary sibilance**
+> (the distributions of normal and residue-heavy regions almost overlap), so it cut 8–11 dB of
+> high frequency across the whole film, sounding just as dull. That code has been removed.
 
 ## Usage
 
@@ -121,6 +184,7 @@ TTS options are built into the UI (language / emotion source / speaking rate). Y
 | `TTS_EMO_VECTOR` | — | 8-dim emotion vector for `vector` mode (comma-separated) |
 | `TTS_DURATION_FACTOR` | `1.0` | Speaking rate: >1 slower, <1 faster |
 | `TTS_MAX_MEL_TOKENS` | `1815` | Max generation length per segment (1815 = the 2.5 ceiling). Lower values **silently truncate** longer lines |
+| `TTS_USE_CUDA_KERNEL` | `false` | BigVGAN's custom CUDA kernel. **Leave it off**: `ninja` is not installed here, and enabling it makes model loading **hang silently** (symptom: one `GPT2InferenceModel has generative capabilities...` line, then nothing — the UI looks idle). The torch fallback is **numerically equivalent with no quality loss**, just a slightly slower vocoder (measured: 15 s init, 2.8 s per line) |
 | `USE_QWEN_EMO` | `false` | Load the Qwen emotion model (required by `text` mode) |
 
 **Per-segment alignment** options for the remux step (`tools/merge_tts_video_improved.py`) — TTS duration
@@ -134,6 +198,7 @@ is time-stretched to its original length with atempo (pitch preserved):
 | `ALIGN_MIN_DEV` | `0.05` | Deviation threshold; anything under 5% is left untouched |
 | `ALIGN_TRIM_OVERFLOW` | `false` | Trim segments that are still too long; when `false` they are only reported in a summary |
 | `TTS_FADE_MS` | `15` | Fade in/out per segment (ms) to avoid hard-cut clicks |
+| `BG_PAD_MS` | `200` | When the original voice is replaced by the instrumental, extend each segment by this many ms on both sides — this **covers the original sentence-tail breath that falls outside the segment** (otherwise the dub ends and the original's breath follows). Neighbouring segments are protected (half the gap); `0` restores the old behaviour |
 | `TTS_LOUDNESS_MATCH` | `true` | Match each segment's loudness to **the RMS of its own original clip** (peak ≠ loudness: the old peak-normalize made dense/boomy segments ~10 dB louder for free) |
 | `TTS_LOUDNESS_OFFSET` | `0.0` | Extra offset (dB) applied after matching; use a positive value for an overall louder dub |
 | `TTS_PEAK_CEIL` | `-1.0` | Peak ceiling (dBFS); anything above is pulled down to avoid mix clipping |
@@ -142,6 +207,46 @@ is time-stretched to its original length with atempo (pitch preserved):
 
 Loudness normalization (`loudnorm I=-16:TP=-1.5:LRA=11`) runs **once** before muxing and is not repeated during
 muxing, so the dynamics are not reshaped twice.
+
+### Reference clip health check (ASR stage, **diagnostics only**)
+
+The TTS reference audio is simply **each segment's own original clip** (`SPK_REF_MODE=segment`, the correct
+choice for simultaneous dubbing). If a clip carries original BGM residue or noise, the model learns those as
+part of the timbre and performance (audible as **gasping delivery, occasional blow-ups, muddy tone**). After
+ASR you can print a health table (CPU only, seconds, **read-only**) that flags **which segments' clips are dirty**:
+
+| Metric | Meaning |
+|---|---|
+| `pause drop` | Level difference between the loudest 20% frames and the "pause band" ← **key metric**. Clean speech drops deep in pauses (measured 37–54 dB in this film); BGM residue only drops 20–32 dB |
+| `speech ratio` | Share of frames more than 6 dB above the pause band (too low = mostly silence/noise) |
+| `band` | Share of energy in the 0.3–4 kHz speech band |
+| `duration` / clipping | Clips outside 0.6–8 s, or clipping, are unsuitable references |
+
+```bash
+python tools/asr.py --only-ref-check     # standalone: no ASR model, existing text untouched
+python tools/asr.py --ref-check          # run right after ASR
+```
+
+The check performs **no** selection, fallback or cleaning, and writes nothing to the JSON (the file's `md5`
+is unchanged before and after). Two reasons (settled 2026-09-14):
+
+1. **Selection/fallback must pool clips by speaker label, and pyannote's multi-speaker labelling is not
+   trustworthy** (tested on Chinese, English and Japanese; it even merged male and female voices into one
+   speaker). Once a label is wrong, the fallback amplifies the error — e.g. the female lead's timbre applied
+   to a male segment. The risk outweighs the benefit.
+2. **Reference cleaning lost an A/B listening test — the original reference won on all three samples**: the
+   −6 dB bell at 120 Hz cuts the male fundamental (i.e. the timbre itself), `afftdn` leaves metallic artefacts
+   the model picks up, and windowing throws away the performance arc the emotion reference needs.
+
+> To actually fix dirty references, go after **vocal separation quality** (e.g. switch to a SOTA model such
+> as BS-Roformer / Mel-Band Roformer), or delete/merge those segments in the annotation UI and re-synthesize
+> them individually.
+
+| Variable | Default | Description |
+|---|---|---|
+| `REF_PAUSE_DROP_MIN` | `30` | Minimum pause drop (dB); below this a clip is flagged dirty |
+| `REF_SPEECH_RATIO_MIN` | `0.5` | Minimum speech-frame ratio |
+| `REF_MIN_SEC` / `REF_MAX_SEC` | `0.6` / `8` | Acceptable clip length (seconds) |
 
 ### Real-time translation (Demo)
 

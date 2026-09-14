@@ -47,6 +47,20 @@ TTS_EMO_MODE=text 时按本句文本实时推断，每句都可以不一样。
   TTS_DURATION_FACTOR=0.5~2.0  语速，>1 变慢、<1 变快（默认 1.0）
   TTS_MAX_MEL_TOKENS=1~1815  单段生成长度上限（默认 1815 = 2.5 上限）
       调小会**静默截断**较长台词（话说一半），除非明确知道原因否则别动。
+
+---------------------------------------------------------------------------
+参考音频：音色与情绪**都取本段自己的切片**（同声配音，逐段跟随原片）
+---------------------------------------------------------------------------
+  * 音色 spk_audio_prompt → 本段切片（`SPK_REF_MODE=fixed` 时改为说话人固定片段，
+    那只是提速近似，会跑偏，别当默认）。
+  * 情绪 emo_audio_prompt → 本段切片。
+  这里**刻意不做**"参考择优 / 回退 / 净化"：
+    - 择优/回退要按"同说话人"分池，而 pyannote 的多说话人标定不可信
+      （主人实测：中日英都试过，甚至把男女声并成一个 speaker）。标签一错，
+      回退就会把错放大（女主的参考套到男主段上）。
+    - 参考净化做过 A/B 试听，三个样本都是**原始参考更好**（削低频削掉的正是音色本体，
+      去噪会留伪影）。
+  想知道哪几段的切片脏，用 `python tools/asr.py --only-ref-check` 看体检表（只读诊断）。
 """
 
 import os
@@ -145,7 +159,16 @@ from indextts.infer_v2_5 import IndexTTS2
 init_kwargs = dict(
     cfg_path=os.path.join(project_root, "index-tts", "checkpoints", "config.yaml"),
     model_dir=os.path.join(project_root, "index-tts", "checkpoints"),
-    use_cuda_kernel=True,   # 使用自定义的CUDA内核来加速BigVGAN的推理（加载失败会自动回退 torch 实现）
+    # ⚠️ use_cuda_kernel 必须显式给 False（2026-09-14 踩坑）：
+    #   =True 时 indextts 会在 import 阶段调 BigVGAN 的自定义 CUDA 内核
+    #   （alias_free_activation/cuda/load.py -> torch.utils.cpp_extension.load），
+    #   需要 ninja **可执行文件**才能编译。本机 nvcc 有、ninja 没有 →
+    #   那个 load 既不报错也不继续，**整个进程无声卡死**（表现为"只打印一句
+    #   GPT2InferenceModel 警告后就光空转"）。注意库的默认值是 None，在 CUDA 上
+    #   等同 True，所以**不传这个参数同样会卡**，必须显式 False。
+    #   代价：BigVGAN 声码器走纯 torch 实现，数值等价、无音质损失，只是略微慢一点
+    #   （实测初始化 15s / 单句推理 2.8s）。装好 ninja 后可用 TTS_USE_CUDA_KERNEL=true 打开。
+    use_cuda_kernel=_env_bool("TTS_USE_CUDA_KERNEL", False),
     use_deepspeed=False,    # 暂时不启用DeepSpeed，因为它可能在某些系统上导致性能下降
     use_accel=False,         # 启用加速引擎来优化GPT模型的推理
     use_torch_compile=False, # 使用torch.compile来进一步优化模型执行
@@ -255,6 +278,19 @@ def build_emo_kwargs(segment_ref_path):
     return dict()  # none：不显式控制，走默认（参考音频自带情绪）
 
 
+# ---------------------------------------------------------------------------
+# 参考音频：音色与情绪都取**本段自己的切片**。
+#
+# 这里刻意不提供"参考择优 / 同说话人回退 / 参考净化"（2026-09-14 结论，别再往回加）：
+#   1) 择优/回退必须按 speaker 标签分池，而 pyannote 的多说话人标定在主人实测里不可信
+#      （中日英都试过，甚至把男女声并成一个 speaker）。标签错 → 回退把错放大，
+#      会把女主的音色套到男主段上，风险大于收益。
+#   2) 参考净化做过 A/B 试听，三个样本主人听下来都是**原始参考最好**：120Hz 削低频
+#      削掉的正是音色本体（男声 F0 约 100~150Hz），afftdn 会留金属味伪影。
+# 想排查"哪几段切片脏"→ 跑 `python tools/asr.py --only-ref-check`（只读诊断，不落文件）。
+# ---------------------------------------------------------------------------
+
+
 # 按说话人分组（仅 fixed 模式对缓存有意义；segment 模式下每段参考都不同）
 if SORT_BY_SPEAKER:
     order = sorted(range(len(segments)), key=lambda i: segments[i]["speaker"])
@@ -280,11 +316,18 @@ for i in order:
 
     seg_ref_path = ref_audio_files[time_key]
 
-    # 音色参考：fixed 模式下用说话人固定片段（缓存命中），失败则回退到本段切片
+    # -----------------------------------------------------------------------
+    # 参考音频：音色与情绪都用**本段自己的切片**
+    #   参考里混入的原片 BGM 残留 / 句末气声会被模型当成"音色 + 表演方式"学过去
+    #   （听感：大喘气、容易炸）。但"换一个参考"的补救办法前提不成立（见文件上方注释），
+    #   所以这里保持最朴素的做法：逐段跟随原片（＝铁律 SPK_REF_MODE=segment）。
+    #   fixed 模式只是提速近似，会跑偏。
+    # -----------------------------------------------------------------------
     if SPK_REF_MODE == "fixed":
         ref_audio_path = speaker_fixed_ref.get(speaker) or seg_ref_path
     else:
         ref_audio_path = seg_ref_path
+    emo_ref_path = seg_ref_path
 
     # 构建输出文件名
     output_filename = f"result_{speaker[-2:]}_{start:.2f}-{end:.2f}.wav"
@@ -292,7 +335,7 @@ for i in order:
 
     print(f"Generating speech: {output_filename}")
     print(f"Text: {text}")
-    print(f"Reference audio: {ref_audio_path}")
+    print(f"Reference audio (音色/情绪): {os.path.basename(ref_audio_path)}  [本段切片]")
 
     # 执行推理
     infer_kwargs = dict(
@@ -310,7 +353,7 @@ for i in order:
         repetition_penalty=10.0,
         max_text_tokens_per_segment=120
     )
-    infer_kwargs.update(build_emo_kwargs(seg_ref_path))
+    infer_kwargs.update(build_emo_kwargs(emo_ref_path))
     # 2.5 需要显式指定语言（日语用 JA）；duration_factor 控制语速，>1 变慢、<1 变快
     infer_kwargs["lang"] = TTS_LANG
     infer_kwargs["duration_factor"] = float(os.environ.get("TTS_DURATION_FACTOR", "1.0"))

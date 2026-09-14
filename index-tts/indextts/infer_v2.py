@@ -1,8 +1,10 @@
 import os
 from subprocess import CalledProcessError
 
-# 使用项目特定的缓存目录，避免全局设置影响（Movie-trans：checkpoints 在项目根）
-os.environ['HF_HUB_CACHE'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'checkpoints', 'hf_cache')
+# [Movie-trans 本地改动] 同 infer_v2_5.py：缓存统一到 <index-tts>/checkpoints/hf_cache，
+# 避免与运行时 ensure_models_available({model_dir}/hf_cache) 不一致导致重复下载。
+os.environ['HF_HUB_CACHE'] = os.path.abspath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'checkpoints', 'hf_cache'))
 import json
 import re
 import time

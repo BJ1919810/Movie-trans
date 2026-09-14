@@ -12,6 +12,19 @@ import shutil
 import gradio as gr
 from typing import Optional
 
+# ---------------------------------------------------------------------------
+# Windows 编码兜底：stdout 被重定向 / 被管道接走时，Python 会退回本地编码
+# （中文系统 = GBK），界面/日志里的 emoji（⚠️ ✅ 🎬 …）会抛 UnicodeEncodeError。
+# 只放宽错误处理、**不改编码**，编不出的字符降级成 '?'，中文与子进程解码都不受影响。
+# 注意：子进程（tools/*.py）在"被管道接走"时也会遇到同样问题，所以那些脚本里
+# 有 emoji 的（asr.py / annotate.py）各自加了同一段兜底。
+# ---------------------------------------------------------------------------
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:   # noqa: BLE001
+        pass
+
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMP_DIR = os.path.join(PROJECT_DIR, "temp")
 RESULTS_DIR = os.path.join(PROJECT_DIR, "results")
@@ -89,7 +102,7 @@ def process_video(video_file_path, output_dir=None):
     except Exception as e:
         return None, f"💥 Error: {type(e).__name__}: {str(e)}"
 
-def denoise_audio(input_audio_path, model_name=None, agg=None, fp16=False):
+def denoise_audio(input_audio_path, model_name=None, agg=None, fp16=False, engine="roformer"):
     try:
         if not input_audio_path or not os.path.exists(input_audio_path):
             return None, None, None, "❌ Input audio file not found."
@@ -101,6 +114,8 @@ def denoise_audio(input_audio_path, model_name=None, agg=None, fp16=False):
 
         denoise_script = os.path.join(PROJECT_DIR, "tools", "denoise.py")
         cmd = [sys.executable, denoise_script, "--input", target_input, "--output-dir", TEMP_DIR]
+        if engine:
+            cmd += ["--engine", str(engine)]
         if model_name:
             cmd += ["--model-name", str(model_name)]
         if agg is not None:
@@ -251,7 +266,8 @@ def run_create_clips(audio_file_path, json_file_path):
     except Exception as e:
         return None, f"💥 Error: {type(e).__name__}: {str(e)}"
 
-def run_asr(clips_dir, json_file_path, language, model_size=None, device=None, compute_type=None):
+def run_asr(clips_dir, json_file_path, language, model_size=None, device=None, compute_type=None,
+            ref_check=False):
     try:
         # 确保文件在标准位置
         expected_clips = os.path.join(TEMP_DIR, "clips")
@@ -275,6 +291,9 @@ def run_asr(clips_dir, json_file_path, language, model_size=None, device=None, c
             cmd += ["--device", str(device)]
         if compute_type:
             cmd += ["--compute_type", str(compute_type)]
+        if ref_check:
+            # 参考切片体检：纯诊断，只打印体检表，不写 JSON、不产文件、不改合成参数
+            cmd += ["--ref-check"]
 
         result = subprocess.run(
             cmd, capture_output=True, text=True, cwd=PROJECT_DIR, timeout=600
@@ -401,13 +420,13 @@ def run_pipeline(video_file, output_dir):
     path_update = audio_path if audio_path else gr.update()
     return audio_path, path_update, message
 
-def run_denoise_pipeline(audio_file_path, model_name=None, agg=None, fp16=False):
-    return denoise_audio(audio_file_path, model_name, agg, fp16)
+def run_denoise_pipeline(audio_file_path, model_name=None, agg=None, fp16=False, engine="roformer"):
+    return denoise_audio(audio_file_path, model_name, agg, fp16, engine)
 
 def run_asr_pipeline(vocal_16k_path, vocal_44k_path, json_file_path, language,
                      cluster_threshold=None, min_cluster_size=None,
                      max_gap=None, min_duration=None, max_duration=None,
-                     model_size=None, device=None, compute_type=None):
+                     model_size=None, device=None, compute_type=None, ref_check=True):
     # UI 里的 "auto" 表示"不传，用脚本自己的默认值"
     if model_size in (None, "", "auto"):
         model_size = None
@@ -458,8 +477,11 @@ def run_asr_pipeline(vocal_16k_path, vocal_44k_path, json_file_path, language,
 
     # 步骤4: 运行ASR
     status_log.append(f"📝 开始语音识别...（模型={model_size}，设备={device}）")
+    if ref_check:
+        status_log.append("🔎 ASR 后顺带打印「参考切片体检表」（只诊断，不影响合成）")
     final_json, msg4 = run_asr(clips_dir, merged_json, language,
-                               model_size=model_size, device=device, compute_type=compute_type)
+                               model_size=model_size, device=device, compute_type=compute_type,
+                               ref_check=ref_check)
     if final_json:
         status_log.append("✅ 语音识别完成！")
     else:
@@ -532,6 +554,12 @@ def run_batch_tts_func(json_file_path, lang, emo_mode, duration_factor,
         tts_script = os.path.join(PROJECT_DIR, "tools", "batch_tts.py")
         cmd = [sys.executable, tts_script]
         env = os.environ.copy()
+        # 关键：子进程 stdout 是"管道"，Python 默认走**块缓冲**（攒满 8KB 才吐），
+        # 所以 TTS 加载权重那半分钟的提示全卡在缓冲区里，界面看起来像"空转"。
+        # 加这个环境变量让子进程逐行输出（实测差别就是"看不到进度"和"看得到"）。
+        # 注意：**不要**在这里设 PYTHONIOENCODING —— 本 Popen 是按本地编码(GBK)解码的，
+        # 子进程改成 UTF-8 会让中文全变乱码。
+        env["PYTHONUNBUFFERED"] = "1"
         env.update({
             "TTS_LANG": str(lang).upper(),
             "TTS_DURATION_FACTOR": str(duration_factor),
@@ -585,21 +613,19 @@ def run_batch_tts_func(json_file_path, lang, emo_mode, duration_factor,
 
 def run_merge_tts_video_func(enable_subtitles, burn_subtitles, output_format,
                              align_tts=True, align_max_rate=1.25, align_min_dev=0.05,
-                             align_trim_overflow=False, tts_fade_ms=15):
-    """运行视频合并（按段对齐参数经环境变量传给脚本）"""
+                             align_trim_overflow=False, tts_fade_ms=15, bg_pad_ms=200):
+    """运行视频合并（按段对齐 / 原声外扩参数经环境变量传给脚本）"""
     try:
-        # 运行merge_tts_video_improved.py脚本
         merge_script = os.path.join(PROJECT_DIR, "tools", "merge_tts_video_improved.py")
         cmd = [sys.executable, merge_script]
 
-        # 添加参数
         if enable_subtitles:
             cmd.append("--enable-subtitles")
         if burn_subtitles:
             cmd.append("--burn-subtitles")
         cmd.extend(["--output-format", output_format])
 
-        # 按段对齐（atempo 保音高）参数通过环境变量传递
+        # 对齐 / 原声外扩参数通过环境变量传给脚本
         env = os.environ.copy()
         env.update({
             "ALIGN_TTS": "true" if align_tts else "false",
@@ -607,16 +633,17 @@ def run_merge_tts_video_func(enable_subtitles, burn_subtitles, output_format,
             "ALIGN_MIN_DEV": str(align_min_dev),
             "ALIGN_TRIM_OVERFLOW": "true" if align_trim_overflow else "false",
             "TTS_FADE_MS": str(int(tts_fade_ms)),
+            "BG_PAD_MS": str(int(bg_pad_ms)),
         })
 
         prefix = (
             f"🎬 合并参数：字幕={enable_subtitles}(硬烧={burn_subtitles}) 格式={output_format}\n"
             f"   按段对齐={align_tts}(最大倍率 {align_max_rate}, 偏差阈值 {align_min_dev}, "
-            f"裁剪超长={align_trim_overflow}, 淡入淡出 {int(tts_fade_ms)}ms)\n"
+            f"裁剪超长={align_trim_overflow}, 淡入淡出 {int(tts_fade_ms)}ms, 原声外扩 {int(bg_pad_ms)}ms)\n"
         )
 
         result = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=PROJECT_DIR, timeout=1200, env=env  # 20分钟超时
+            cmd, capture_output=True, text=True, cwd=PROJECT_DIR, timeout=1200, env=env
         )
 
         if result.returncode != 0:
@@ -624,7 +651,8 @@ def run_merge_tts_video_func(enable_subtitles, burn_subtitles, output_format,
 
         output_video_path = os.path.join(RESULTS_DIR, f"output_improved.{output_format}")
         if os.path.exists(output_video_path):
-            return f"{prefix}✅ Merge TTS & Video completed successfully!\nOutput video: {output_video_path}\n{result.stdout}", output_video_path
+            return (f"{prefix}✅ Merge TTS & Video completed successfully!\n"
+                    f"Output video: {output_video_path}\n{result.stdout}"), output_video_path
         else:
             return f"{prefix}⚠️ Merge completed but output video not found.\n{result.stdout}", None
 
@@ -632,8 +660,6 @@ def run_merge_tts_video_func(enable_subtitles, burn_subtitles, output_format,
         return "⏱️ Timeout: Merge TTS & Video took too long.", None
     except Exception as e:
         return f"💥 Error: {type(e).__name__}: {str(e)}", None
-
-
 # ==================== Gradio UI ====================
 def load_json_content(json_file):
     """读取 JSON 供预览面板显示"""
@@ -672,16 +698,25 @@ with gr.Blocks(title="Movie-trans 视频处理全流程") as demo:
                     )
                     denoise_btn = gr.Button("🔊 开始降噪", variant="primary")
 
-                    with gr.Accordion("⚙️ 高级：降噪参数", open=False):
+                    with gr.Accordion("⚙️ 高级：降噪 / 人声分离参数", open=False):
+                        denoise_engine = gr.Dropdown(
+                            label="分离引擎", choices=["roformer", "uvr5"], value="roformer",
+                            info="roformer=BS-Roformer（默认，A/B 实测效果最好）/ "
+                                 "uvr5=VR 架构 HP2（更快、体积小，但 BGM 响的段落残留更多）"
+                        )
                         denoise_model = gr.Textbox(
-                            label="UVR5 模型名", value="HP2_all_vocals",
-                            info="须是 uvr5/uvr5_weights/ 下已存在的 .pth 模型名"
+                            label="模型名", value="model_bs_roformer_ep_317_sdr_12.9755",
+                            info="roformer 引擎填 .ckpt 模型名（如 model_bs_roformer_ep_317_sdr_12.9755）；"
+                                 "uvr5 引擎填 .pth 模型名（如 HP2_all_vocals）。都不含扩展名"
                         )
                         denoise_agg = gr.Slider(
                             label="人声提取激进程度", minimum=0, maximum=20, value=10, step=1,
-                            info="越高越激进地切掉伴奏，可能削到人声；15 以上慎用"
+                            info="仅 uvr5 引擎有效；越高越激进地切掉伴奏，可能削到人声"
                         )
-                        denoise_fp16 = gr.Checkbox(label="半精度推理（省显存，默认关）", value=False)
+                        denoise_fp16 = gr.Checkbox(
+                            label="半精度推理", value=True,
+                            info="省显存。roformer 引擎本来就默认半精度，勾不勾都一样"
+                        )
 
             with gr.Column(scale=1):
                 with gr.Group():
@@ -743,6 +778,11 @@ with gr.Blocks(title="Movie-trans 视频处理全流程") as demo:
                         asr_compute_type = gr.Dropdown(
                             label="精度", choices=["auto", "float16", "int8", "float32"], value="auto"
                         )
+                    asr_ref_check = gr.Checkbox(
+                        label="ASR 后打印「参考切片体检」表（只诊断）", value=True,
+                        info="纯只读：按「停顿降幅/语音占比/时长」标出哪些段的原片切片混了 BGM 残留，"
+                             "不写 JSON、不产出文件、不影响合成。单独跑也可：python tools/asr.py --only-ref-check"
+                    )
 
                 with gr.Group():
                     gr.Markdown("### 📤 输出")
@@ -868,6 +908,10 @@ with gr.Blocks(title="Movie-trans 视频处理全流程") as demo:
                         merge_fade_ms = gr.Slider(
                             label="每段淡入淡出 (ms)", minimum=0, maximum=200, value=15, step=5
                         )
+                        merge_bg_pad = gr.Slider(
+                            label="原声替换外扩 (ms)", minimum=0, maximum=500, value=200, step=10,
+                            info="把原声换成伴奏时向前后多扩一点，盖掉段外的原声句末气声；相邻段按间距一半保护"
+                        )
 
                 with gr.Group():
                     gr.Markdown("### 📂 输出文件")
@@ -894,7 +938,7 @@ with gr.Blocks(title="Movie-trans 视频处理全流程") as demo:
                     inputs=[
                         merge_enable_subtitles, merge_burn_subtitles, merge_output_format,
                         merge_align_tts, merge_align_max_rate, merge_align_min_dev,
-                        merge_align_trim, merge_fade_ms,
+                        merge_align_trim, merge_fade_ms, merge_bg_pad,
                     ],
                     outputs=[merge_status_output, tts_output_video]
                 )
@@ -907,7 +951,7 @@ with gr.Blocks(title="Movie-trans 视频处理全流程") as demo:
     )
     denoise_btn.click(
         fn=run_denoise_pipeline,
-        inputs=[audio_input_path, denoise_model, denoise_agg, denoise_fp16],
+        inputs=[audio_input_path, denoise_model, denoise_agg, denoise_fp16, denoise_engine],
         outputs=[vocal_16k_output, vocal_44k_output, bg_output, status_output]
     )
     run_asr_btn.click(
@@ -916,7 +960,7 @@ with gr.Blocks(title="Movie-trans 视频处理全流程") as demo:
             asr_vocal_16k, asr_vocal_44k, asr_json_file, asr_language,
             asr_cluster_threshold, asr_min_cluster_size,
             asr_max_gap, asr_min_duration, asr_max_duration,
-            asr_model_size, asr_device, asr_compute_type,
+            asr_model_size, asr_device, asr_compute_type, asr_ref_check,
         ],
         outputs=[asr_json_output, asr_clips_dir, asr_status_output]
     )

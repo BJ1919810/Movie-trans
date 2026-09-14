@@ -6,8 +6,23 @@
 此脚本用于下载项目所需的所有模型文件，包括：
 1. 克隆index-tts仓库
 2. 下载ASR相关模型到asr/models目录
-3. 下载HuggingFace缓存模型到checkpoints/hf_cache目录
+3. 下载 IndexTTS 辅助模型到 index-tts/checkpoints/hf_cache（**唯一权威位置**）
 4. 下载Index-TTS相关模型到index-tts/checkpoints目录
+
+⚠️ 关于"模型放哪里"的约定（2026-09-14 规范，改动前务必读完）
+   ------------------------------------------------------------------
+   * IndexTTS-2.5 主权重 + 全部辅助模型，**只在** ``index-tts/checkpoints/`` 这一处：
+       index-tts/checkpoints/                 主权重（gpt.pth / s2mel.pth / codec.pth / config.yaml …）
+       index-tts/checkpoints/hf_cache/        辅助模型的扁平布局
+         ├── w2v-bert-2.0/                    facebook/w2v-bert-2.0
+         ├── bigvgan/                         nvidia/bigvgan_v2_22khz_80band_256x
+         ├── campplus_cn_common.bin           funasr/campplus
+         └── semantic_codec_model.safetensors amphion/MaskGCT
+   * 这个位置由 ``indextts.utils.model_download.ensure_models_available(model_dir)`` 决定，
+     是**运行时真正读取的地方**。本脚本直接调用它，不再自己拼路径。
+   * ASR/说话人分离的模型在 ``asr/models/``，与上面互不相干。
+   * **不要**再往 ``<项目根>/checkpoints/hf_cache/`` 下载东西 —— 那是历史遗留的第二套目录，
+     会导致同一批模型存两份（实测重复约 2.5 GB）。
 """
 
 import os
@@ -15,7 +30,7 @@ import sys
 import subprocess
 import shutil
 from pathlib import Path
-from huggingface_hub import snapshot_download, hf_hub_download
+from huggingface_hub import snapshot_download
 
 # 获取项目根目录
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -127,86 +142,46 @@ def download_asr_models():
     print(f"ASR模型下载完成 ({success_count}/{len(asr_models)})")
     return success_count == len(asr_models)
 
-def download_hf_cache_models():
-    """下载HuggingFace缓存模型到checkpoints/hf_cache目录"""
-    hf_cache_dir = os.path.join(PROJECT_ROOT, "checkpoints", "hf_cache")
-    os.makedirs(hf_cache_dir, exist_ok=True)
-    
-    print("开始下载HF缓存模型...")
-    
-    # 设置HF缓存目录
-    os.environ['HF_HUB_CACHE'] = hf_cache_dir
-    
-    # HF缓存模型列表
-    hf_models = {
-        "w2v-bert-2.0": {
-            "repo_id": "facebook/w2v-bert-2.0",
-            "filename": None  # 下载整个仓库
-        },
-        "campplus": {
-            "repo_id": "funasr/campplus",
-            "filename": None  # 下载整个仓库
-        },
-        "bigvgan_v2_22khz_80band_256x": {
-            "repo_id": "nvidia/bigvgan_v2_22khz_80band_256x",
-            "filename": None  # 下载整个仓库
-        },
-        "MaskGCT": {
-            "repo_id": "amphion/MaskGCT",
-            "filename": None  # 下载整个仓库
-        }
-    }
-    
-    success_count = 0
-    for model_name, model_info in hf_models.items():
-        print(f"正在下载 {model_name}...")
-        try:
-            if model_info["filename"]:
-                # 下载单个文件
-                # 正确构建HuggingFace缓存路径
-                repo_dir = os.path.join(hf_cache_dir, "models--" + model_info["repo_id"].replace("/", "--"))
-                blobs_dir = os.path.join(repo_dir, "blobs")
-                
-                # 检查文件是否已存在（通过检查blobs目录）
-                if os.path.exists(blobs_dir) and os.listdir(blobs_dir):
-                    print(f"  文件 {model_name}/{model_info['filename']} 已存在，跳过下载")
-                    success_count += 1
-                    continue
-                
-                # 确保目录存在
-                os.makedirs(blobs_dir, exist_ok=True)
-                hf_hub_download(
-                    repo_id=model_info["repo_id"],
-                    filename=model_info["filename"],
-                    cache_dir=hf_cache_dir,
-                    token=os.environ.get("HF_TOKEN") if os.environ.get("HF_TOKEN") != "YOUR_HF_TOKEN" else None
-                )
-            else:
-                # 下载整个仓库
-                # 正确构建HuggingFace缓存路径
-                model_path = os.path.join(hf_cache_dir, "models--" + model_info["repo_id"].replace("/", "--"))
-                snapshots_path = os.path.join(model_path, "snapshots")
-                
-                # 检查模型是否已存在（通过检查snapshots目录）
-                if os.path.exists(snapshots_path) and os.listdir(snapshots_path):
-                    print(f"  模型 {model_name} 已存在，跳过下载")
-                    success_count += 1
-                    continue
-                
-                snapshot_download(
-                    repo_id=model_info["repo_id"],
-                    cache_dir=hf_cache_dir,
-                    local_files_only=False,
-                    token=os.environ.get("HF_TOKEN") if os.environ.get("HF_TOKEN") != "YOUR_HF_TOKEN" else None
-                )
-                
-            print(f"  ✓ {model_name} 下载完成")
-            success_count += 1
-        except Exception as e:
-            print(f"  ✗ {model_name} 下载失败: {e}")
-    
-    print(f"HF缓存模型下载完成 ({success_count}/{len(hf_models)})")
-    return success_count == len(hf_models)
+def download_aux_models():
+    """下载 IndexTTS 的辅助模型（w2v-bert-2.0 / MaskGCT codec / CAMPPlus / BigVGAN）
+
+    ⚠️ 权威位置只有一个：``index-tts/checkpoints/hf_cache/``
+    （＝运行时 ``ensure_models_available(model_dir)`` 用的 ``{model_dir}/hf_cache``）。
+
+    这里**直接复用 index-tts 自己的解析器**，而不是自己拼路径 + 自己 snapshot_download
+    —— 这样"下载脚本"与"运行时"永远用同一套查找规则，不会出现
+    「下到 A、运行时找 B → 又下一遍」的情况：
+
+        1. ``{model_dir}/hf_cache/`` 已有的扁平布局  → 复用
+        2. 历史本地位置（``{model_dir}/w2v-bert-2.0``、``{model_dir}/nvidia/...``）→ 复用
+        3. 旧版 HuggingFace 缓存布局（``models--owner--name/snapshots/<hash>/``）→ 迁移复用
+        4. 都没有才下载（ModelScope / hf-mirror / HuggingFace 自动选路）
+
+    旧版本这个函数把模型下到 ``<项目根>/checkpoints/hf_cache/``，
+    和运行时用的 ``index-tts/checkpoints/hf_cache/`` 是两套目录 → 同一批模型存两份
+    （实测重复约 2.5 GB）。**不要再改回去。**
+    """
+    model_dir = os.path.join(PROJECT_ROOT, "index-tts", "checkpoints")
+    if not os.path.isdir(model_dir):
+        print(f"  ✗ 找不到 {model_dir}，请先执行： python Download_indextts25.py")
+        return False
+
+    # HF 直连不通时走镜像（可用环境变量覆盖；国内实测 huggingface.co 超时）
+    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+    print(f"辅助模型目录（权威位置）: {os.path.join(model_dir, 'hf_cache')}")
+    try:
+        sys.path.insert(0, os.path.join(PROJECT_ROOT, "index-tts"))
+        from indextts.utils.model_download import ensure_models_available
+        paths = ensure_models_available(model_dir)
+    except Exception as e:
+        print(f"  ✗ 辅助模型准备失败: {e}")
+        return False
+
+    print("  ✓ 辅助模型就位：")
+    for key, path in paths.items():
+        print(f"      {key:16s} {path}")
+    return True
 
 def download_faster_whisper_model():
     """下载Faster-Whisper大型模型到asr/models目录"""
@@ -276,9 +251,9 @@ def main():
     if not download_asr_models():
         print("ASR模型下载未完全成功")
     
-    # 3. 下载HF缓存模型
-    if not download_hf_cache_models():
-        print("HF缓存模型下载未完全成功")
+    # 3. 下载 IndexTTS 辅助模型（权威位置：index-tts/checkpoints/hf_cache）
+    if not download_aux_models():
+        print("辅助模型下载未完全成功")
     
     # 4. 下载Faster-Whisper大型模型
     if not download_faster_whisper_model():

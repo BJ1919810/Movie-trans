@@ -18,6 +18,17 @@ import glob
 import re
 import argparse
 import copy
+
+# ---------------------------------------------------------------------------
+# Windows 编码兜底：stdout 被重定向 / 被管道接走时，Python 会退回本地编码
+# （中文系统 = GBK），脚本里打印的 emoji（🎧 ✅ 🔄 …）会抛 UnicodeEncodeError。
+# 只放宽错误处理、**不改编码**，编不出的字符降级成 '?'，中文不受影响。
+# ---------------------------------------------------------------------------
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:   # noqa: BLE001
+        pass
 import uuid
 import librosa
 import numpy as np

@@ -70,7 +70,10 @@ funasr_vad_model_path = os.path.join(asr_models_path, "speech_fsmn_vad_zh-cn-16k
 funasr_punc_model_path = os.path.join(asr_models_path, "punc_ct-transformer_zh-cn-common-vocab272727-pytorch")
 
 # TTS模型路径配置
-tts_checkpoint_path = os.path.join(project_path, "checkpoints")
+# 注意：IndexTTS 的权重与辅助模型**只在 index-tts/checkpoints/**（唯一权威位置）。
+# 项目根下的 checkpoints/ 是历史遗留的第二套目录，已于 2026-09-14 删除，
+# 不要再指向它，否则会误判"模型不存在"并触发重复下载。
+tts_checkpoint_path = os.path.join(project_path, "index-tts", "checkpoints")
 default_ref_audio_path = os.path.join(project_path, "default_ref_voice.wav")  # 默认参考音频
 
 # DeepSeek API配置（请替换为您的API密钥）
@@ -205,7 +208,11 @@ def preload_models():
                 preloaded_models['tts'] = IndexTTS2(
                     cfg_path=tts_config_path,
                     model_dir=tts_model_dir,
-                    use_bf16=True
+                    use_bf16=True,
+                    # 必须显式 False：库默认 None 在 CUDA 上等同 True，会去编译
+                    # BigVGAN 的自定义 CUDA 内核（需要 ninja 可执行文件），
+                    # 本机没装 ninja → 无声卡死。详见 tools/batch_tts.py 的注释。
+                    use_cuda_kernel=False,
                 )
                 logger.info("IndexTTS-2.5 模型初始化完成(bf16)")
             except Exception as e:

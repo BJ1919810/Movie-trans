@@ -16,6 +16,19 @@ from funasr import AutoModel
 from modelscope import snapshot_download
 from tqdm import tqdm
 
+# ---------------------------------------------------------------------------
+# Windows 编码兜底：stdout 一旦被重定向 / 被上级进程用管道接走，Python 会退回
+# 本地编码（中文系统 = GBK），脚本里打印的 emoji（⚠️ ✅ 🔄 …）会直接抛
+# UnicodeEncodeError 把整条流水线打断（已踩过一次：主 UI 调本脚本时崩在 ⚠️）。
+# 这里只放宽错误处理、**不改编码** —— 编不出的字符降级成 '?'，
+# 中文与上级进程的解码方式都保持原样，不会产生乱码。
+# ---------------------------------------------------------------------------
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:   # noqa: BLE001  （老版本 / 非常规流：忽略）
+        pass
+
 # 获取项目根目录（tools目录的父目录）
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -91,7 +104,7 @@ def create_funasr_model(language="zh"):
                         time.sleep(5)  # 等待5秒后重试
                     else:
                         raise RuntimeError(
-                            f"❌ {model_key.upper()} 模型下载失败！请检查网络或 ModelScope Token。\n"
+                            f"[X] {model_key.upper()} 模型下载失败！请检查网络或 ModelScope Token。\n"
                             f"Model ID: {model_info['model_id']}, Revision: {revision}\n"
                             f"Error: {e}"
                         )
@@ -307,6 +320,196 @@ def process_clips(clips_dir, diarization_file, model, language=None):
     print(f"\nAll recognition results saved to: {diarization_file}")
 
 
+# ===========================================================================
+# 参考切片体检（**只诊断**：不改合成行为、不写 JSON、不产出任何文件）
+# ---------------------------------------------------------------------------
+# 为什么需要它：
+#   同声配音时，每段的"音色/情绪参考"就是该段自己的原片切片。切片里一旦混入原片
+#   BGM 残留或噪声，模型会把它当成"音色 + 表演方式"学过去（听感：大喘气、容易炸、
+#   音质糊）。这个体检表用**纯音频指标**指出哪些段的切片是脏的。
+#
+# ⚠️ 它为什么**不做**"择优 / 回退 / 净化"（2026-09-14 的结论，别再往回加）：
+#   1) 任何"同说话人择优/回退"都依赖 pyannote 的 speaker 标签，而主人的实测结论是
+#      **pyannote 多说话人标定不可信**（中日英都试过，甚至把男女声并成一个 speaker）。
+#      标签一错，回退只会把错放大（女主的参考被套到男主段上）。
+#   2) 参考净化（削低频/去噪/裁窗口）做过 A/B，主人听下来**三个样本都是原始参考更好**
+#      —— 120Hz 削低频削掉的正是音色本体，afftdn 会上金属味伪影。
+#   所以这里只输出诊断；要改质量应该从**人声分离**下手。
+#
+# 用法（都很快，不加载 ASR 模型）：
+#   python tools/asr.py --only-ref-check        # 单独跑体检
+#   python tools/asr.py --ref-check             # 跟在 ASR 之后顺带跑
+#
+# 指标（纯 CPU，零新依赖）：
+#   pause_drop   最响 20% 帧 与 "停顿档" 帧 的电平差  ← **核心指标**
+#                干净语音：停顿里只剩本底噪声，降得很深（本片实测 37~54dB）
+#                混了 BGM：停顿里还有音乐在响，只降 20~32dB
+#                （不用绝对噪声底：切片首尾若有数字静音，噪声底会变 -inf、SNR 虚高到 100+）
+#   ratio        能量高于停顿档 6dB 的帧占比（太低说明大半是静音/噪声）
+#   band         语音频段(0.3–4kHz) 能量占比
+#   dur / clip   时长是否落在 0.6~8s、有无削顶
+#
+# 环境变量（都有默认值，一般不用动）：
+#   REF_PAUSE_DROP_MIN=30  REF_SPEECH_RATIO_MIN=0.5  REF_MIN_SEC=0.6  REF_MAX_SEC=8
+# ===========================================================================
+try:
+    import soundfile as _sf
+    import numpy as _np
+except ImportError:  # 理论上项目环境都有
+    _sf = None
+    _np = None
+
+REF_PAUSE_DROP_MIN = float(os.environ.get("REF_PAUSE_DROP_MIN", "30"))
+REF_SPEECH_RATIO_MIN = float(os.environ.get("REF_SPEECH_RATIO_MIN", "0.5"))
+REF_MIN_SEC = float(os.environ.get("REF_MIN_SEC", "0.6"))
+REF_MAX_SEC = float(os.environ.get("REF_MAX_SEC", "8"))
+
+
+def _db(v):
+    return 20 * _np.log10(max(float(v), 1e-12))
+
+
+def _load_mono(path):
+    """读成单声道 float64（切片是 44.1k 立体声，体检用不上双声道）"""
+    x, sr = _sf.read(path, dtype="float64", always_2d=True)
+    return x.mean(axis=1), sr
+
+
+def _frame_bands(x, sr, frame_ms=20):
+    """逐帧算 低频(80-300) / 语音频段(300-4000) / 总能量，返回三个数组"""
+    fl = max(16, int(sr * frame_ms / 1000))
+    n_frames = max(0, (len(x) - fl) // fl)
+    low, high, tot = [], [], []
+    for i in range(n_frames):
+        seg = x[i * fl:(i + 1) * fl]
+        spec = _np.abs(_np.fft.rfft(seg * _np.hanning(len(seg)))) ** 2
+        freq = _np.fft.rfftfreq(len(seg), 1 / sr)
+        lo = float(spec[(freq >= 80) & (freq < 300)].sum())
+        hi = float(spec[(freq >= 300) & (freq < 4000)].sum())
+        low.append(lo)
+        high.append(hi)
+        tot.append(lo + hi)
+    return _np.array(low), _np.array(high), _np.array(tot)
+
+
+def analyze_clip(path):
+    """单条切片的体检指标；读不到或太短返回 None"""
+    try:
+        x, sr = _load_mono(path)
+    except Exception:  # noqa: BLE001
+        return None
+    dur = len(x) / sr
+    if dur < 0.15:
+        return None
+    low, high, tot = _frame_bands(x, sr)
+    if len(tot) < 3:
+        return None
+    order = _np.argsort(tot)
+    n_loud = max(2, len(order) // 5)
+    loud = order[-n_loud:]                                  # 最响 = 说话
+    # 取 20%~45% 分位那一档当"停顿"：既不是数字静音，也不是说话
+    lo_i, hi_i = max(1, len(order) // 5), max(2, int(len(order) * 0.45))
+    quiet = order[lo_i:hi_i] if hi_i > lo_i else order[:n_loud]
+    speech_level = float(tot[loud].mean())
+    pause_level = float(tot[quiet].mean())
+    pause_drop = _db(speech_level) - _db(pause_level)
+    ratio = float((tot > max(pause_level, 1e-12) * 4).mean())
+    band = 100.0 * float(high.sum()) / max(float(high.sum() + low.sum()), 1e-30)
+    clip_cnt = int((_np.abs(x) >= 0.999).sum())
+
+    ok = (REF_MIN_SEC <= dur <= REF_MAX_SEC
+          and pause_drop >= REF_PAUSE_DROP_MIN
+          and ratio >= REF_SPEECH_RATIO_MIN
+          and clip_cnt == 0)
+    return {
+        "dur": dur, "pause_drop": pause_drop, "ratio": ratio,
+        "band": band, "clip": clip_cnt, "ok": bool(ok),
+    }
+
+
+def _clip_path_for_segment(segment, clips_dir):
+    """按 speaker/start/end 找该段的切片（文件名两位小数，JSON 里可能不是 → 容差匹配）"""
+    speaker = str(segment.get("speaker", ""))
+    start = float(segment.get("start", 0) or 0)
+    end = float(segment.get("end", 0) or 0)
+    folder = os.path.join(clips_dir, speaker)
+    hits = sorted(Path(folder).glob(f"clip_*_{start:.2f}-{end:.2f}.wav")) if os.path.isdir(folder) else []
+    if hits:
+        return str(hits[0])
+    for cand in sorted(Path(folder).glob("clip_*.wav")) if os.path.isdir(folder) else []:
+        info = get_clip_info_from_filename(cand.name)
+        if info and abs(info["start"] - start) <= 0.01 and abs(info["end"] - end) <= 0.01:
+            return str(cand)
+    return None
+
+
+def run_ref_check(diarization_file, clips_dir=None):
+    """逐段打印参考切片体检表（只读；返回 (检查段数, 统计)）"""
+    if _sf is None:
+        print("!! 缺少 soundfile/numpy，跳过参考体检")
+        return 0, {}
+    clips_dir = clips_dir or os.path.join(project_root, "temp", "clips")
+    if not os.path.isdir(clips_dir):
+        print(f"!! 找不到切片目录 {clips_dir}，跳过参考体检")
+        return 0, {}
+
+    with open(diarization_file, "r", encoding="utf-8") as f:
+        segments = json.load(f)
+
+    cache = {}
+
+    def metrics_of(p):
+        if p not in cache:
+            cache[p] = analyze_clip(p)
+        return cache[p]
+
+    stats = {"clean": 0, "dirty": 0, "no_clip": 0}
+    dirty_rows = []
+    print()
+    print("  参考切片体检（只诊断，不改变合成行为）")
+    print("  段                        说话人        时长  停顿降幅  语音占比   频段  判定")
+    for seg in segments:
+        start = float(seg.get("start", 0) or 0)
+        end = float(seg.get("end", 0) or 0)
+        spk = str(seg.get("speaker", "?"))
+        label = f"{start:>6.2f}-{end:<6.2f}"
+        clip = _clip_path_for_segment(seg, clips_dir)
+        m = metrics_of(clip) if clip else None
+        if m is None:
+            stats["no_clip"] += 1
+            print(f"  {label} {spk:<12s}    ——      切片缺失/过短，无法体检")
+            continue
+        if m["ok"]:
+            stats["clean"] += 1
+            verdict = "OK"
+        else:
+            stats["dirty"] += 1
+            dirty_rows.append((seg, m, clip))
+            verdict = "脏"
+        print(f"  {label} {spk:<12s} {m['dur']:5.2f} {m['pause_drop']:8.1f} "
+              f"{m['ratio'] * 100:8.0f}% {m['band']:5.0f}%   {verdict}")
+
+    print()
+    print(f"体检汇总: 干净 {stats['clean']} / 脏 {stats['dirty']} / 无切片 {stats['no_clip']}")
+    print(f"判定阈值: 停顿降幅≥{REF_PAUSE_DROP_MIN:.0f}dB、语音占比≥{REF_SPEECH_RATIO_MIN * 100:.0f}%、"
+          f"时长 {REF_MIN_SEC:.1f}~{REF_MAX_SEC:.1f}s、无削顶")
+    if dirty_rows:
+        print()
+        print(f"[!] {len(dirty_rows)} 段的参考切片混有连续噪声/BGM 残留——这些段的合成最容易出问题：")
+        for seg, m, clip in dirty_rows[:20]:
+            print(f"     {float(seg.get('start', 0) or 0):>6.2f}-{float(seg.get('end', 0) or 0):<6.2f} "
+                  f"{str(seg.get('speaker', '?')):<12s} 停顿仅降 {m['pause_drop']:5.1f}dB  "
+                  f"{os.path.basename(clip)}")
+        if len(dirty_rows) > 20:
+            print(f"     ... 另有 {len(dirty_rows) - 20} 段")
+        print("   → 根源是**人声分离质量**（后半段 BGM 起来时尤其明显）。")
+        print("     可选做法：换 SOTA 分离模型（BS-Roformer / Mel-Band Roformer 等）、")
+        print("     在标注页删掉/合并这些段、或对它们单独重新合成。")
+    print()
+    print("（本体检只读：未写入 JSON、未产出净化文件、未改变任何合成参数）")
+    return len(segments), stats
+
+
 def main():
     # 导入torch以检查CUDA可用性
     try:
@@ -321,8 +524,24 @@ def main():
     parser.add_argument("--compute_type", type=str, default="float16" if cuda_available else "int8", 
                        help="计算类型")
     parser.add_argument("--language", type=str, default=None, help="音频语言")
+    # 参考切片体检（只诊断：不写 JSON、不产文件、不改合成参数）
+    parser.add_argument("--ref-check", action="store_true",
+                        help="ASR 结束后顺带打印参考切片体检表")
+    parser.add_argument("--only-ref-check", action="store_true",
+                        help="只打印参考切片体检表，跳过 ASR（不加载模型、不清空已有文本）")
+    parser.add_argument("--clips-dir", type=str,
+                        default=os.path.join(project_root, "temp", "clips"),
+                        help="切片目录（默认 temp/clips）")
+    parser.add_argument("--diarization-json", type=str,
+                        default=os.path.join(project_root, "results", "speaker_diarization.json"),
+                        help="说话人 JSON（默认 results/speaker_diarization.json）")
     
     args = parser.parse_args()
+
+    # 只做体检：不加载 ASR 模型、不动 raw_text/result_text，秒级完成
+    if args.only_ref_check:
+        run_ref_check(args.diarization_json, args.clips_dir)
+        return
     
     # 确保模型目录存在
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -383,9 +602,9 @@ def main():
                         print("Model download completed!")
                         break
                     except Exception as e:
-                        print(f"[⚠️ Warning] Attempt {attempt + 1} to download Faster-Whisper model failed: {str(e)}")
+                        print(f"[! Warning] Attempt {attempt + 1} to download Faster-Whisper model failed: {str(e)}")
                         if attempt < max_retries - 1:
-                            print(f"[🔄 Retry] Waiting 5 seconds before attempt {attempt + 2}...")
+                            print(f"[Retry] Waiting 5 seconds before attempt {attempt + 2}...")
                             time.sleep(5)
                         else:
                             raise
@@ -418,7 +637,7 @@ def main():
                 print("Model download completed!")
                 break
             except Exception as e:
-                print(f"[⚠️ Warning] Attempt {attempt + 1} to download Faster-Whisper model failed: {str(e)}")
+                print(f"[! Warning] Attempt {attempt + 1} to download Faster-Whisper model failed: {str(e)}")
                 if "cublas64_12.dll" in str(e):
                     print("Detected CUDA library issue, switching to CPU mode")
                     args.device = "cpu"
@@ -430,12 +649,12 @@ def main():
                     except Exception as cpu_e:
                         print(f"Failed to load model in CPU mode as well: {str(cpu_e)}")
                         if attempt < max_retries - 1:
-                            print(f"[🔄 Retry] Waiting 5 seconds before attempt {attempt + 2}...")
+                            print(f"[Retry] Waiting 5 seconds before attempt {attempt + 2}...")
                             time.sleep(5)
                         else:
                             raise
                 elif attempt < max_retries - 1:
-                    print(f"[🔄 Retry] Waiting 5 seconds before attempt {attempt + 2}...")
+                    print(f"[Retry] Waiting 5 seconds before attempt {attempt + 2}...")
                     time.sleep(5)
                 else:
                     raise
@@ -447,6 +666,11 @@ def main():
     
     # 处理音频片段
     process_clips(clips_dir, diarization_file, model, args.language)
+
+    # 参考切片体检（只诊断；不做选择/回退/净化——理由见 run_ref_check 上方注释）
+    if args.ref_check:
+        print()
+        run_ref_check(diarization_file, clips_dir)
 
 
 if __name__ == "__main__":

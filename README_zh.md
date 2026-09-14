@@ -82,13 +82,78 @@ python Download_indextts25.py
 
 脚本带字节校验，中断重跑会续传/覆盖不完整文件。
 
-**ASR / pyannote 模型**（走 HuggingFace，pyannote 需先在 `.env` 配好 `HF_TOKEN`）：
+**ASR / pyannote 模型 + IndexTTS 辅助模型**（pyannote 需先在 `.env` 配好 `HF_TOKEN`）：
 
 ```bash
 python Download_models.py
 ```
 
-UVR5 权重已内置 `HP2-all-vocals`（`uvr5/uvr5_weights/`）；FunASR 模型首次运行会自动下载。
+### 模型放哪里（唯一权威位置，别改）
+
+| 内容 | 位置 | 谁在用 |
+|---|---|---|
+| IndexTTS-2.5 主权重（`gpt.pth` / `s2mel.pth` / `codec.pth` / `config.yaml` / …） | `index-tts/checkpoints/` | `tools/batch_tts.py`、`real-time/model_server_streaming.py` |
+| IndexTTS **辅助模型**（扁平布局） | `index-tts/checkpoints/hf_cache/` | `indextts.utils.model_download.ensure_models_available(model_dir)` |
+| ├ `w2v-bert-2.0/` | ↑ | `facebook/w2v-bert-2.0` |
+| ├ `bigvgan/`（`config.json` + `bigvgan_generator.pt`） | ↑ | `nvidia/bigvgan_v2_22khz_80band_256x` |
+| ├ `campplus_cn_common.bin` | ↑ | `funasr/campplus` |
+| └ `semantic_codec_model.safetensors` | ↑ | `amphion/MaskGCT` |
+| ASR / pyannote / Whisper / FunASR | `asr/models/` | `tools/asr.py`、`tools/speaker_diarization.py` |
+| 人声分离权重 | `uvr5/uvr5_weights/` | `tools/denoise.py` |
+
+两条规矩：
+
+1. **辅助模型的唯一权威位置是 `index-tts/checkpoints/hf_cache/`** —— 它就是
+   `ensure_models_available(model_dir)` 用的 `{model_dir}/hf_cache`，也是运行时真正读取的地方。
+   两个下载脚本（`Download_indextts25.py` / `Download_models.py`）都会下到这里，且**已存在就跳过**。
+2. **不要往 `<项目根>/checkpoints/` 下任何东西**。那是历史遗留的第二套目录：
+   同一批模型（w2v-bert 2.2GB / bigvgan 428MB / campplus / MaskGCT）被存了两份，
+   合计 **3.56 GB**，已于 2026-09-14 删除（删除前逐文件 sha256 校验过与权威目录完全一致）。
+   现在运行时也不再有代码指向它。
+
+UVR5 权重需自行准备（`uvr5/uvr5_weights/`）：默认引擎 `roformer` 用 BS-Roformer（见下节），
+备选的 `uvr5` 引擎需要 `HP2_all_vocals.pth`。FunASR 模型首次运行会自动下载。
+
+### 人声分离：两个引擎（默认 BS-Roformer）
+
+`tools/denoise.py` 支持两种引擎，输出文件名完全一致，下游不用改：
+
+| `--engine` | 模型 | 权重 | 质量 / 速度 |
+|---|---|---|---|
+| **`roformer`（默认）** | **BS-Roformer** `model_bs_roformer_ep_317_sdr_12.9755` | 610 MB（见下） | RTX 3070 上 121s 音频约 53s。**A/B 实测效果最好**：高频残留最少、齿音与气息保留完整 |
+| `uvr5` | VR 架构 `HP2_all_vocals` | 60 MB | 更快、体积小，但 BGM 响的段落人声里残留明显更多 |
+
+```bash
+# 默认就是 roformer，直接跑
+python tools/denoise.py --input temp/output_audio.wav
+# 想切回旧引擎
+python tools/denoise.py --input temp/output_audio.wav --engine uvr5 --model-name HP2_all_vocals
+```
+
+**权重放置**：`uvr5/uvr5_weights/model_bs_roformer_ep_317_sdr_12.9755.ckpt` + 同名 `.yaml`，
+文件名必须含 `bs_roformer`（或 `mel_band_roformer`）才能被自动识别。
+
+下载（实测 `huggingface.co` 直连不通，用镜像）：
+
+```bash
+# 权重 610MB
+curl -L -o uvr5/uvr5_weights/model_bs_roformer_ep_317_sdr_12.9755.ckpt \
+  "https://hf-mirror.com/Sucial/MSST-WebUI/resolve/main/All_Models/vocal_models/model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+# 配置
+curl -L -o uvr5/uvr5_weights/model_bs_roformer_ep_317_sdr_12.9755.yaml \
+  "https://raw.githubusercontent.com/TRvlvr/application_data/main/mdx_model_data/mdx_c_configs/model_bs_roformer_ep_317_sdr_12.9755.yaml"
+```
+
+校验值（`sha256`）：`5b84f37e8d444c8cb30c79d77f613a41c05868ff9c9ac6c7049c00aefae115aa`
+
+**注意**：roformer 引擎**必须跑在 CUDA 上**（`uvr5/bsroformer.py` 内部写死了 `torch.amp.autocast("cuda")`），
+默认半精度（`--fp32` 可关）。`--agg` 只对 uvr5 引擎有效。
+
+> ⚠️ **不要在这之后加"去噪 / 去回响 / 清高频"后处理**（2026-09-14 定论）。
+> 原因一：denoise / de-reverb 是**全带重建**，会连人声泛音尾巴与房间残响一起重画 → 听感变"干"。
+> 原因二：连"只削超出人声包络的宽带残留"这种纯频谱阈值方案也不行 ——
+> `HF(3-10k)/语音核` 这个比值**分不开"鸟鸣"和"正常齿音"**（正常段与残留段的分布几乎重合），
+> 结果把全片高频一起削 8~11dB，同样变闷。该方案已删除。
 
 ## 使用
 
@@ -119,6 +184,7 @@ TTS 环节的选项已集成到 UI（语言 / 情绪来源 / 语速）；也可�
 | `TTS_EMO_VECTOR` | — | `vector` 模式的 8 维情绪向量，逗号分隔 |
 | `TTS_DURATION_FACTOR` | `1.0` | 语速：>1 变慢，<1 变快 |
 | `TTS_MAX_MEL_TOKENS` | `1815` | 单段生成长度上限（1815 = 2.5 上限）。调小会**静默截断**较长台词 |
+| `TTS_USE_CUDA_KERNEL` | `false` | BigVGAN 声码器的自定义 CUDA 内核。**别开**：本机没有 `ninja` 可执行文件，开了会在**加载阶段无声卡死**（现象：只打印一句 `GPT2InferenceModel has generative capabilities...` 就再无输出、界面像"空转"）。关掉走纯 torch 实现，**数值等价、无音质损失**，只是声码器略慢（实测初始化 15s、单句 2.8s） |
 | `USE_QWEN_EMO` | `false` | 加载 Qwen 情感模型（`text` 模式需要） |
 
 回填视频（`tools/merge_tts_video_improved.py`）的**按段对齐**选项——TTS 时长很少正好等于原段时长，
@@ -131,6 +197,7 @@ TTS 环节的选项已集成到 UI（语言 / 情绪来源 / 语速）；也可�
 | `ALIGN_MIN_DEV` | `0.05` | 时长偏差阈值，5% 以内不动 |
 | `ALIGN_TRIM_OVERFLOW` | `false` | 对齐后仍超长的段是否裁到段长；`false` 时只在日志汇总告警 |
 | `TTS_FADE_MS` | `15` | 每段淡入淡出毫秒数，避免硬切爆音 |
+| `BG_PAD_MS` | `200` | 把原声替换成伴奏时，段边界向前后各多扩多少毫秒——**盖掉落在段外的原声句末气声**（否则成片里中文台词念完会紧跟一声原声尾气）。相邻段按间距一半做重叠保护；`0` = 旧行为 |
 | `TTS_LOUDNESS_MATCH` | `true` | 逐段把 TTS 响度**对齐到该段原声切片的 RMS**（峰值≠响度：旧的按峰值归一化会让"闷响/密度高"的段平白响 ~10 dB） |
 | `TTS_LOUDNESS_OFFSET` | `0.0` | 对齐后再叠加的偏移 dB，想整体更响就调正 |
 | `TTS_PEAK_CEIL` | `-1.0` | 峰值上限 dBFS，超过就整体下压（防叠加削顶） |
@@ -138,6 +205,43 @@ TTS 环节的选项已集成到 UI（语言 / 情绪来源 / 语速）；也可�
 | `OUTPUT_SR` | `44100` | 成片音频采样率。**别删也别乱改**：ffmpeg 的 loudnorm 不指定 `-ar` 会把输出落成 192kHz，AAC 编码器上限 96kHz，成片就会变成非常规的 96k 音轨（实测同码率 SNR 低 3.1 dB） |
 
 全片响度归一化（`loudnorm I=-16:TP=-1.5:LRA=11`）只在合片前做**一次**，封装时不再重复，避免二次压缩动态。
+
+### 参考切片体检（ASR 阶段，**只诊断**）
+
+TTS 的参考音频就是**每段自己的原片切片**（`SPK_REF_MODE=segment`，同声配音的正确解）。
+切片里一旦混入原片 BGM 残留或噪声，模型会把它当成"音色 + 表演方式"学过去
+（听感就是**大喘气、容易炸、音质糊**）。ASR 跑完可以顺带打印一张体检表（纯 CPU、秒级、**只读**），
+告诉你**哪些段的切片是脏的**：
+
+| 指标 | 含义 |
+|---|---|
+| `停顿降幅` | 最响 20% 帧 与"停顿档"帧 的电平差 ← **核心指标**。干净语音停顿里只剩本底噪声，降得很深（本片实测 37~54 dB）；混了 BGM 只降 20~32 dB |
+| `语音占比` | 能量高于停顿档 6 dB 的帧占比（太低说明大半是静音/噪声） |
+| `频段` | 语音频段 0.3–4 kHz 能量占比 |
+| `时长` / 削顶 | 落在 0.6~8 s 之外、或有削顶的切片不适合当参考 |
+
+```bash
+python tools/asr.py --only-ref-check     # 单独跑：不加载 ASR 模型、不清空已有文本
+python tools/asr.py --ref-check          # 跟在 ASR 之后顺带跑
+```
+
+体检**不做**任何选择、回退、净化，也不往 JSON 写字段（跑前跑后 `md5` 不变）。两个原因（2026-09-14 定论）：
+
+1. **择优/回退必须按 speaker 标签分池，而 pyannote 的多说话人标定不可信**（中日英都试过，
+   甚至把男女声并成一个 speaker）。标签一错，回退只会把错放大 → 女主的参考被套到男主段上，
+   风险大于收益。
+2. **参考净化做过 A/B 试听，三个样本都是原始参考最好**：120 Hz 削低频削掉的正是音色本体
+   （男声 F0 ≈ 100~150 Hz），`afftdn` 去噪会在语音上留金属味伪影被模型学走，
+   裁窗口又砍掉了情绪参考的表演起伏。
+
+> 想治脏参考 → 从**人声分离质量**下手（默认引擎已是 BS-Roformer，见上文「人声分离：两个引擎」），
+> 或在标注页删掉/合并这些段、对它们单独重新合成。
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `REF_PAUSE_DROP_MIN` | `30` | 停顿降幅下限（dB），低于它判为"脏" |
+| `REF_SPEECH_RATIO_MIN` | `0.5` | 语音帧占比下限 |
+| `REF_MIN_SEC` / `REF_MAX_SEC` | `0.6` / `8` | 切片时长合规区间（秒） |
 
 ### 实时翻译（Demo）
 

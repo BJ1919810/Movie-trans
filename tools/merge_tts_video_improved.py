@@ -26,6 +26,8 @@ sys.path.append(project_root)
 #   ALIGN_MIN_DEV=0.05       时长偏差阈值，低于 5% 不动（默认 0.05）
 #   ALIGN_TRIM_OVERFLOW=false 对齐后仍超长的段是否裁剪到段长（默认 false，只告警）
 #   TTS_FADE_MS=15           每段淡入淡出毫秒数，避免硬切爆音（默认 15）
+#   BG_PAD_MS=200            把原声替换成伴奏时，段边界向前后各多扩多少毫秒
+#                            （盖掉段外的原声句末气声/尾音；相邻段按间距一半保护；0 = 旧行为）
 #
 # 同声配音：逐段响度对齐（重要，别改回"按峰值归一化"）
 #   以前用 normalize(-3dBFS) 是**按峰值**归一化，而峰值不等于响度：
@@ -49,6 +51,12 @@ ALIGN_MAX_RATE = float(os.environ.get("ALIGN_MAX_RATE", "1.25"))
 ALIGN_MIN_DEV = float(os.environ.get("ALIGN_MIN_DEV", "0.05"))
 ALIGN_TRIM_OVERFLOW = _env_bool("ALIGN_TRIM_OVERFLOW", False)
 TTS_FADE_MS = int(os.environ.get("TTS_FADE_MS", "15"))
+
+# 把原声替换成纯伴奏时，段边界向前后各多扩多少毫秒（默认 200）。
+# 目的：盖掉落在 diarization 边界之外的**原声句末气声/尾音**（如日配句末的「はぁ」），
+# 否则成片会出现"中文念完紧跟一声原声尾气"。相邻段之间按间距的一半做重叠保护。
+# 设 0 可回到旧行为。
+BG_PAD_MS = int(os.environ.get("BG_PAD_MS", "200"))
 
 # --- 逐段响度对齐（见文件头说明）---------------------------------------------
 LOUDNESS_MATCH = _env_bool("TTS_LOUDNESS_MATCH", True)
@@ -237,7 +245,17 @@ def get_existing_audio():
         return extracted_audio_path
 
 def insert_background_audio(original_audio_path, bg_audio_path, segments):
-    """根据时间戳将背景音频插入到指定位置"""
+    """根据时间戳把原声替换成纯伴奏（背景音）
+
+    为什么要在段边界外**多扩一点**（BG_PAD_MS）：
+        diarization/VAD 给出的是"语音段"边界，而原片在句末往往还有一小截
+        气声/尾音/呼吸（例如日配句末的「はぁ」）。它落在 [start, end] 之外，
+        原来的实现只替换 [start, end]，于是这段**原声气声被原样保留**，
+        成片听起来就是"中文台词念完，紧跟着一声日语尾气"。
+        这里按 BG_PAD_MS 向前后各扩一点，把尾巴盖掉；
+        并按相邻段的间距做**重叠保护**（最多扩到间距的一半），不会吃掉邻段开头。
+    """
+    pad_ms = BG_PAD_MS
     print("Loading original audio...")
     original_audio = AudioSegment.from_wav(original_audio_path)
     
@@ -245,20 +263,32 @@ def insert_background_audio(original_audio_path, bg_audio_path, segments):
     bg_audio = AudioSegment.from_wav(bg_audio_path)
     
     print("Inserting background audio into specified positions...")
+    if pad_ms > 0:
+        print(f"段边界外扩 {pad_ms}ms（相邻段按间距一半做重叠保护）")
     # 分别保存原始音频和背景音频，便于后续独立处理
     audio_with_bg = original_audio
     bg_segments_positions = []
     
+    # 先按时间正序算好每段"实际要替换的区间"（扩边界需要看邻居，倒序算不方便）
+    ordered = sorted(segments, key=lambda x: x['start'])
+    spans = []
+    for i, seg in enumerate(ordered):
+        start_ms = int(round(seg['start'] * 1000))
+        end_ms = int(round(seg['end'] * 1000))
+        pad_start = pad_end = pad_ms
+        if pad_ms > 0:
+            if i > 0:
+                gap = start_ms - int(round(ordered[i - 1]['end'] * 1000))
+                pad_start = max(0, min(pad_ms, gap // 2))
+            if i < len(ordered) - 1:
+                gap = int(round(ordered[i + 1]['start'] * 1000)) - end_ms
+                pad_end = max(0, min(pad_ms, gap // 2))
+        spans.append((start_ms - pad_start, end_ms + pad_end, seg))
+
     # 按时间倒序处理，避免位置偏移
-    sorted_segments = sorted(segments, key=lambda x: x['start'], reverse=True)
-    
-    for segment in sorted_segments:
-        start_time = segment['start']
-        end_time = segment['end']
-        
-        # 计算插入位置（毫秒）
-        start_position = int(start_time * 1000)
-        end_position = int(end_time * 1000)
+    for start_position, end_position, _segment in sorted(spans, key=lambda x: x[0], reverse=True):
+        start_position = max(0, start_position)
+        end_position = max(start_position, end_position)
         
         # 从背景音频中提取对应片段
         bg_segment = bg_audio[start_position:end_position]
@@ -275,7 +305,7 @@ def insert_background_audio(original_audio_path, bg_audio_path, segments):
             'segment': bg_segment
         })
         
-        print(f"Background audio inserted at {start_time}s - {end_time}s position")
+        print(f"Background audio inserted at {start_position / 1000:.2f}s - {end_position / 1000:.2f}s position")
     
     return audio_with_bg, bg_segments_positions
 

@@ -1,8 +1,13 @@
 import os
 from subprocess import CalledProcessError
 
-# 使用项目特定的缓存目录，避免全局设置影响（Movie-trans：checkpoints 在项目根）
-os.environ['HF_HUB_CACHE'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'checkpoints', 'hf_cache')
+# [Movie-trans 本地改动] 辅助模型缓存统一到 <index-tts>/checkpoints/hf_cache ——
+# 即 ensure_models_available(model_dir) 用的那个 {model_dir}/hf_cache。
+# 以前这里指向项目根 checkpoints/hf_cache，与运行时实际使用的位置**不一致**，
+# 同一批模型（w2v-bert / bigvgan / campplus / MaskGCT）被存了两份（约 2.5GB）。
+# 注意：这是对 vendored 的 index-tts 的修改，重新 clone/升级 index-tts 后需要重新应用。
+os.environ['HF_HUB_CACHE'] = os.path.abspath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'checkpoints', 'hf_cache'))
 import json
 import re
 import time
