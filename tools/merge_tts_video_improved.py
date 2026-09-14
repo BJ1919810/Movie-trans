@@ -131,6 +131,23 @@ def _match_loudness(tts_audio, ref_path):
 # ---------------------------------------------------------------------------
 OUTPUT_SR = int(os.environ.get("OUTPUT_SR", "44100"))
 
+# --- 全片响度归一化（见 normalize_loudness 的长注释，别改回单遍 -16 LUFS）------
+#   LOUDNESS_TARGET=source|<LUFS>   默认 source：目标跟随原片实测响度（不灌水）
+#                                   给数字则固定目标，如 -16 / -23
+#   LOUDNESS_TP=-1.5                真峰值上限 dBTP
+#   LOUDNESS_LRA=11                 响度范围（linear 模式下只参与测量）
+LOUDNESS_TP = float(os.environ.get("LOUDNESS_TP", "-1.5"))
+LOUDNESS_LRA = float(os.environ.get("LOUDNESS_LRA", "11"))
+_LT_RAW = os.environ.get("LOUDNESS_TARGET", "source").strip().lower()
+if _LT_RAW in ("", "source", "auto", "original", "orig"):
+    LOUDNESS_TARGET = None            # None = 对齐原片
+else:
+    try:
+        LOUDNESS_TARGET = float(_LT_RAW)
+    except ValueError:
+        print(f"   ! LOUDNESS_TARGET='{_LT_RAW}' 解析不了，改用 source（跟随原片）")
+        LOUDNESS_TARGET = None
+
 
 def probe_video_size(video_path, fallback=(852, 480)):
     """用 ffprobe 探测视频分辨率（字幕 PlayRes 必须与视频一致，否则字幕错位/大小失真）"""
@@ -221,6 +238,90 @@ def _run_ffmpeg(args, desc=""):
         tail = "\n".join((res.stderr or "").strip().splitlines()[-8:])
         raise RuntimeError(f"ffmpeg 执行失败（{desc}，returncode={res.returncode}）:\n{tail}")
     return res
+
+
+def _measure_loudness(audio_path, I=-16.0, TP=-1.5, LRA=11.0):
+    """跑一遍 loudnorm 的**分析**（只测量、不写输出），返回实测参数。
+
+    loudnorm 在 print_format=json 下会把测量结果打到 stderr，这里把最后一段
+    JSON 抠出来。用于两遍模式的第一遍。
+    """
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-i", str(audio_path),
+           "-af", f"loudnorm=I={I}:TP={TP}:LRA={LRA}:print_format=json",
+           "-f", "null", "-"]
+    res = subprocess.run(cmd, capture_output=True, text=True,
+                         encoding="utf-8", errors="replace")
+    err = res.stderr or ""
+    a, b = err.rfind("{"), err.rfind("}")
+    if res.returncode != 0 or a < 0 or b <= a:
+        tail = "\n".join(err.strip().splitlines()[-8:])
+        raise RuntimeError(
+            f"loudnorm 分析失败（{audio_path}，returncode={res.returncode}）:\n{tail}")
+    return json.loads(err[a:b + 1])
+
+
+def _finite_num(x):
+    """loudnorm 在静音素材上会把响度报成 -inf，统一判成"非有限"。"""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return False
+    return v == v and v not in (float("inf"), float("-inf"))
+
+
+def normalize_loudness(mix_path, out_path, target_path=None):
+    """全片响度归一化：**两遍 linear**，目标默认 = 原片实测响度。
+
+    为什么必须是两遍 + linear（别改回单遍 `loudnorm=I=-16:TP=-1.5:LRA=11`）：
+      单遍 loudnorm 走的是 dynamic 模式，会**时变地**调增益 —— 安静的开头
+      （无台词的纯 BGM）被额外多推约 10 dB；而固定目标 -16 LUFS 又远高于
+      素材本身（实测原片只有 -29.3 LUFS），于是整片被灌 +13.9 dB。
+      听感就是"成片 BGM 比原片响一大截（尤其开头），连人声也一起变吵"。
+      两遍 = 先量全片、再用**单一恒定增益**，开头与对白的比例得以还原；
+      目标跟随原片 = 成片电平与原片一致，不再灌水。
+    实测（121s 素材，121s 处即全片）：
+      原片        开头-全局 = -9.83 dB   ← 基准
+      旧(单遍)    开头-全局 = -0.18 dB   ← 开头被抬 9.65 dB
+      新(两遍)    开头-全局 = -11.36 dB  ← 还原；全局 -33.65 vs 原片 -33.64
+    环境变量见文件上方 LOUDNESS_*。
+    """
+    target_lufs = LOUDNESS_TARGET
+
+    # ---- 1. 定目标响度：默认量原片 ----
+    if target_lufs is None:
+        ref = target_path or mix_path
+        m_ref = _measure_loudness(ref, I=-16.0, TP=LOUDNESS_TP, LRA=LOUDNESS_LRA)
+        if _finite_num(m_ref.get("input_i")):
+            target_lufs = float(m_ref["input_i"])
+            print(f"   目标响度 = 原片实测 {target_lufs:.2f} LUFS（跟随原片，不灌水）")
+        else:
+            print(f"   ! 原片测不到有效响度（input_i={m_ref.get('input_i')}），"
+                  f"跳过响度归一化，只重采样")
+
+    passthrough = (target_lufs is None)
+
+    # ---- 2. 量混音 ----
+    m = None
+    if not passthrough:
+        m = _measure_loudness(mix_path, I=target_lufs, TP=LOUDNESS_TP, LRA=LOUDNESS_LRA)
+        if not _finite_num(m.get("input_i")):
+            print(f"   ! 混音测不到有效响度（input_i={m.get('input_i')}），"
+                  f"跳过响度归一化，只重采样")
+            passthrough = True
+
+    # ---- 3. 两遍 linear 应用 ----
+    # -ar 必须给：否则 loudnorm 会把输出落成 192kHz（见文件头 OUTPUT_SR 的说明）
+    if passthrough:
+        _run_ffmpeg(["-y", "-i", mix_path, "-ar", str(OUTPUT_SR), out_path],
+                    "仅重采样（跳过响度归一化）")
+        return
+
+    af = (f"loudnorm=I={target_lufs}:TP={LOUDNESS_TP}:LRA={LOUDNESS_LRA}"
+          f":measured_I={m['input_i']}:measured_TP={m['input_tp']}"
+          f":measured_LRA={m['input_lra']}:measured_thresh={m['input_thresh']}"
+          f":offset={m['target_offset']}:linear=true")
+    _run_ffmpeg(["-y", "-i", mix_path, "-af", af, "-ar", str(OUTPUT_SR), out_path],
+                f"全片响度归一化（两遍 linear，目标 {target_lufs:.2f} LUFS）")
 
 
 def get_existing_audio():
@@ -643,13 +744,11 @@ def main():
     temp_audio_path = os.path.join(project_root, "temp", "temp_final_audio.wav")
     final_audio.export(temp_audio_path, format="wav")
     
-    # 使用ffmpeg进行loudnorm处理（全片唯一一次响度归一化，合视频时不再重复）
-    # -ar 必须给：否则 loudnorm 会把输出落成 192kHz（见文件头 OUTPUT_SR 的说明）
+    # 两遍 linear loudnorm，目标响度跟随原片（见 normalize_loudness 的长注释）。
+    # 合视频那步不再做任何增益，所以这里是全片唯一的响度处理环节。
     normalized_audio_path = final_audio_path
-    _run_ffmpeg(["-y", "-i", temp_audio_path,
-                 "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-                 "-ar", str(OUTPUT_SR),
-                 normalized_audio_path], "全片响度归一化 loudnorm")
+    normalize_loudness(temp_audio_path, normalized_audio_path,
+                       target_path=original_audio_path)
     
     # 删除临时文件
     if os.path.exists(temp_audio_path):

@@ -204,9 +204,22 @@ is time-stretched to its original length with atempo (pitch preserved):
 | `TTS_PEAK_CEIL` | `-1.0` | Peak ceiling (dBFS); anything above is pulled down to avoid mix clipping |
 | `TTS_MIN_RMS` | `-30.0` | Lower bound for the target loudness (dBFS), so very quiet originals don't become inaudible |
 | `OUTPUT_SR` | `44100` | Output audio sample rate. **Do not remove or change lightly**: without an explicit `-ar`, ffmpeg's loudnorm writes its output at 192 kHz, and since the AAC encoder caps at 96 kHz the film ends up with an unusual 96 kHz track (measured 3.1 dB worse SNR at the same bitrate) |
+| `LOUDNESS_TARGET` | `source` | Target loudness of the whole film. `source` = **follow the original's measured loudness** (recommended; the film ends up at the original's level); a number pins it, e.g. `-16` or `-23` |
+| `LOUDNESS_TP` | `-1.5` | True-peak ceiling (dBTP) for the whole-film normalization |
+| `LOUDNESS_LRA` | `11` | Loudness range (in `linear` mode it only participates in measurement, it does not reshape dynamics) |
 
-Loudness normalization (`loudnorm I=-16:TP=-1.5:LRA=11`) runs **once** before muxing and is not repeated during
-muxing, so the dynamics are not reshaped twice.
+Whole-film loudness normalization uses **two-pass `linear`** (the first pass measures, the second applies a
+**single constant gain**), with the target defaulting to **the original's measured loudness**. It runs
+**once** before muxing and is not repeated during muxing.
+
+> **Do not revert to single-pass `loudnorm=I=-16:TP=-1.5:LRA=11`**: single-pass runs in `dynamic` mode and
+> applies a **time-varying** gain — the quiet opening (pure BGM, no dialogue) gets pushed ~10 dB further,
+> while the fixed −16 LUFS target sits far above the material itself (the original measures only −29.3 LUFS),
+> pumping +13.9 dB into the whole film. It sounds like "the dub's BGM is far louder than the original,
+> especially at the start", with the voice going loud too.
+> Measured on a 121 s clip (metric = opening−global loudness ratio): old single-pass **−0.18 dB** →
+> new two-pass **−11.36 dB** (original baseline **−9.83 dB**), with the global level at −33.65 dBFS
+> matching the original's −33.64 dBFS.
 
 ### Reference clip health check (ASR stage, **diagnostics only**)
 
