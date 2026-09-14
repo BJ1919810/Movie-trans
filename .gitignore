@@ -3,7 +3,10 @@
 index-tts/checkpoints/
 # ASR / pyannote 模型（python Download_models.py 或首次运行自动下载）
 asr/models/
-# UVR5 权重：HP2_all_vocals.pth 随仓库提供，其余权重如需可另行下载
+# UVR5 人声/伴奏分离权重（体积大：610MB + 60MB），不进仓库，
+# 用 python Download_models.py 下载到 uvr5/uvr5_weights/（含 sha256 校验）
+uvr5/uvr5_weights/*.pth
+uvr5/uvr5_weights/*.ckpt
 # 根目录 hf_cache（辅助模型缓存）
 checkpoints/
 # BigVGAN CUDA 扩展构建产物

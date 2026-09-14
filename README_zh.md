@@ -130,21 +130,38 @@ python tools/denoise.py --input temp/output_audio.wav
 python tools/denoise.py --input temp/output_audio.wav --engine uvr5 --model-name HP2_all_vocals
 ```
 
-**权重放置**：`uvr5/uvr5_weights/model_bs_roformer_ep_317_sdr_12.9755.ckpt` + 同名 `.yaml`，
-文件名必须含 `bs_roformer`（或 `mel_band_roformer`）才能被自动识别。
+**权重放置**：`uvr5/uvr5_weights/`，文件名必须与 `tools/denoise.py` 的默认模型名一致
+（roformer 的权重名需含 `bs_roformer` 或 `mel_band_roformer` 才能被自动识别）。
 
-下载（实测 `huggingface.co` 直连不通，用镜像）：
+**两个引擎的权重都由 `Download_models.py` 下载**（体积大，**不进 git**）：
 
 ```bash
-# 权重 610MB
+python Download_models.py    # 下到 uvr5/uvr5_weights/（已存在且 sha256 一致就跳过）
+```
+
+| 引擎 | 文件 | 大小 |
+|---|---|---|
+| `roformer`（默认） | `model_bs_roformer_ep_317_sdr_12.9755.ckpt` + 同名 `.yaml` | 610 MB + 2 KB |
+| `uvr5`（备选） | `HP2_all_vocals.pth` | 60 MB |
+
+手动下载（脚本走的就是这些地址；实测 `huggingface.co` 直连不通，用镜像）：
+
+```bash
+# BS-Roformer 权重 610MB
 curl -L -o uvr5/uvr5_weights/model_bs_roformer_ep_317_sdr_12.9755.ckpt \
   "https://hf-mirror.com/Sucial/MSST-WebUI/resolve/main/All_Models/vocal_models/model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 # 配置
 curl -L -o uvr5/uvr5_weights/model_bs_roformer_ep_317_sdr_12.9755.yaml \
   "https://raw.githubusercontent.com/TRvlvr/application_data/main/mdx_model_data/mdx_c_configs/model_bs_roformer_ep_317_sdr_12.9755.yaml"
+# VR 架构 HP2（uvr5 引擎）60MB
+curl -L -o uvr5/uvr5_weights/HP2_all_vocals.pth \
+  "https://hf-mirror.com/lj1995/VoiceConversionWebUI/resolve/main/uvr5_weights/HP2_all_vocals.pth"
 ```
 
-校验值（`sha256`）：`5b84f37e8d444c8cb30c79d77f613a41c05868ff9c9ac6c7049c00aefae115aa`
+校验值（`sha256`）：
+- BS-Roformer `.ckpt`：`5b84f37e8d444c8cb30c79d77f613a41c05868ff9c9ac6c7049c00aefae115aa`
+- BS-Roformer `.yaml`：`2bfdd16c656bd9519aba757cc4f8834b7ede675eb1e00ec4772d74ae1c41af7f`
+- `HP2_all_vocals.pth`：`39796caa5db18d7f9382d8ac997ac967bfd85f7761014bb807d2543cc844ef05`
 
 **注意**：roformer 引擎**必须跑在 CUDA 上**（`uvr5/bsroformer.py` 内部写死了 `torch.amp.autocast("cuda")`），
 默认半精度（`--fp32` 可关）。`--agg` 只对 uvr5 引擎有效。

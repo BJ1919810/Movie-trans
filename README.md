@@ -126,21 +126,38 @@ python tools/denoise.py --input temp/output_audio.wav
 python tools/denoise.py --input temp/output_audio.wav --engine uvr5 --model-name HP2_all_vocals
 ```
 
-**Where to put the weights**: `uvr5/uvr5_weights/model_bs_roformer_ep_317_sdr_12.9755.ckpt` plus a
-same-named `.yaml`. The filename must contain `bs_roformer` (or `mel_band_roformer`) to be auto-detected.
+**Where to put the weights**: `uvr5/uvr5_weights/`, with filenames matching the default model names in
+`tools/denoise.py` (the roformer weight must contain `bs_roformer` or `mel_band_roformer` to be auto-detected).
 
-Download (`huggingface.co` is not directly reachable here — use the mirror):
+**Both engines' weights are fetched by `Download_models.py`** (too large for git, so **not committed**):
 
 ```bash
-# weights, 610MB
+python Download_models.py    # downloads into uvr5/uvr5_weights/ (skips when present and sha256 matches)
+```
+
+| Engine | Files | Size |
+|---|---|---|
+| `roformer` (default) | `model_bs_roformer_ep_317_sdr_12.9755.ckpt` + same-named `.yaml` | 610 MB + 2 KB |
+| `uvr5` (fallback) | `HP2_all_vocals.pth` | 60 MB |
+
+Manual download (these are the exact URLs the script uses; `huggingface.co` is not directly reachable, use the mirror):
+
+```bash
+# BS-Roformer weights, 610MB
 curl -L -o uvr5/uvr5_weights/model_bs_roformer_ep_317_sdr_12.9755.ckpt \
   "https://hf-mirror.com/Sucial/MSST-WebUI/resolve/main/All_Models/vocal_models/model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 # config
 curl -L -o uvr5/uvr5_weights/model_bs_roformer_ep_317_sdr_12.9755.yaml \
   "https://raw.githubusercontent.com/TRvlvr/application_data/main/mdx_model_data/mdx_c_configs/model_bs_roformer_ep_317_sdr_12.9755.yaml"
+# VR-arch HP2 (uvr5 engine), 60MB
+curl -L -o uvr5/uvr5_weights/HP2_all_vocals.pth \
+  "https://hf-mirror.com/lj1995/VoiceConversionWebUI/resolve/main/uvr5_weights/HP2_all_vocals.pth"
 ```
 
-Checksum (`sha256`): `5b84f37e8d444c8cb30c79d77f613a41c05868ff9c9ac6c7049c00aefae115aa`
+Checksums (`sha256`):
+- BS-Roformer `.ckpt`: `5b84f37e8d444c8cb30c79d77f613a41c05868ff9c9ac6c7049c00aefae115aa`
+- BS-Roformer `.yaml`: `2bfdd16c656bd9519aba757cc4f8834b7ede675eb1e00ec4772d74ae1c41af7f`
+- `HP2_all_vocals.pth`: `39796caa5db18d7f9382d8ac997ac967bfd85f7761014bb807d2543cc844ef05`
 
 **Note**: the roformer engine **requires CUDA** (`uvr5/bsroformer.py` hardcodes `torch.amp.autocast("cuda")`)
 and defaults to half precision (`--fp32` disables it). `--agg` only applies to the uvr5 engine.

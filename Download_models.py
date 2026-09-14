@@ -8,6 +8,7 @@
 2. 下载ASR相关模型到asr/models目录
 3. 下载 IndexTTS 辅助模型到 index-tts/checkpoints/hf_cache（**唯一权威位置**）
 4. 下载Index-TTS相关模型到index-tts/checkpoints目录
+5. 下载人声/伴奏分离权重（UVR5）到 uvr5/uvr5_weights —— BS-Roformer（默认引擎）+ HP2
 
 ⚠️ 关于"模型放哪里"的约定（2026-09-14 规范，改动前务必读完）
    ------------------------------------------------------------------
@@ -29,6 +30,9 @@ import os
 import sys
 import subprocess
 import shutil
+import time
+import hashlib
+import urllib.request
 from pathlib import Path
 from huggingface_hub import snapshot_download
 
@@ -236,6 +240,129 @@ def download_faster_whisper_model():
     return True
 
 
+# ===========================================================================
+# 人声/伴奏分离权重（UVR5）—— 体积大，**不进 git**，由本脚本下载
+#   运行时查找位置见 tools/denoise.py：
+#       weight_uvr5_root = <项目根>/uvr5/uvr5_weights
+#       roformer（默认引擎）-> {model_name}.ckpt + 同名 .yaml
+#       uvr5（备选）        -> {model_name}.pth
+#   文件名必须与 denoise.py 的默认模型名一致，否则运行时找不到。
+#   国内网络：huggingface.co 直连不通，权重统一走 hf-mirror.com（实测可用）；
+#   .yaml 配置在 GitHub raw（实测可达）。
+# ===========================================================================
+_SEPARATION_FILES = [
+    {
+        "name": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+        "url": ("https://hf-mirror.com/Sucial/MSST-WebUI/resolve/main/"
+                "All_Models/vocal_models/model_bs_roformer_ep_317_sdr_12.9755.ckpt"),
+        "sha256": "5b84f37e8d444c8cb30c79d77f613a41c05868ff9c9ac6c7049c00aefae115aa",
+        "size": 639331213,
+        "desc": "BS-Roformer 人声分离权重（roformer 引擎，默认）",
+    },
+    {
+        "name": "model_bs_roformer_ep_317_sdr_12.9755.yaml",
+        "url": ("https://raw.githubusercontent.com/TRvlvr/application_data/main/"
+                "mdx_model_data/mdx_c_configs/model_bs_roformer_ep_317_sdr_12.9755.yaml"),
+        "sha256": "2bfdd16c656bd9519aba757cc4f8834b7ede675eb1e00ec4772d74ae1c41af7f",
+        "size": 2273,
+        "desc": "BS-Roformer 配置（与 .ckpt 同名；缺失时引擎回退内置默认配置）",
+    },
+    {
+        "name": "HP2_all_vocals.pth",
+        "url": ("https://hf-mirror.com/lj1995/VoiceConversionWebUI/resolve/main/"
+                "uvr5_weights/HP2_all_vocals.pth"),
+        "sha256": "39796caa5db18d7f9382d8ac997ac967bfd85f7761014bb807d2543cc844ef05",
+        "size": 63454827,
+        "desc": "VR 架构 HP2 人声分离权重（uvr5 引擎，备选）",
+    },
+]
+
+
+def _sha256_of(path, chunk=1 << 20):
+    """计算文件 sha256（分块读，避免大权重把内存吃满）"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _download_file(url, dest):
+    """流式下载到 dest（先写 .part 再原子改名，避免中断留下半个文件）。
+
+    用标准库 urllib，不引入新依赖；hf-mirror 会 302 到 CDN，urllib 自动跟随。
+    """
+    tmp = dest + ".part"
+    req = urllib.request.Request(url, headers={"User-Agent": "Movie-trans-Download_models"})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        next_report = 0.1
+        while True:
+            block = resp.read(1 << 20)
+            if not block:
+                break
+            out.write(block)
+            done += len(block)
+            if total:
+                ratio = done / total
+                if ratio >= next_report:
+                    print(f"      {ratio * 100:4.0f}%   "
+                          f"{done / 1048576:7.1f} MB / {total / 1048576:.1f} MB")
+                    next_report += 0.1
+    os.replace(tmp, dest)
+
+
+def download_separation_models():
+    """下载人声/伴奏分离权重（UVR5 双引擎）到 uvr5/uvr5_weights/
+
+    两个引擎各一份权重，**都不进 git**（610MB + 60MB 太大）：
+      * roformer（默认）：BS-Roformer  .ckpt + 同名 .yaml
+      * uvr5（备选）     ：HP2_all_vocals.pth
+
+    已存在且 sha256 一致就跳过；大小/sha256 不符则重下。
+    """
+    target_dir = os.path.join(PROJECT_ROOT, "uvr5", "uvr5_weights")
+    os.makedirs(target_dir, exist_ok=True)
+    print("开始下载人声/伴奏分离权重（UVR5）...")
+    print(f"  目标目录: {target_dir}")
+
+    ok = 0
+    for spec in _SEPARATION_FILES:
+        dest = os.path.join(target_dir, spec["name"])
+        size_mb = spec["size"] / 1048576
+
+        # 已存在且校验通过 -> 跳过（避免重复下载 610MB）
+        if os.path.exists(dest) and os.path.getsize(dest) == spec["size"]:
+            if _sha256_of(dest) == spec["sha256"]:
+                print(f"  [skip] {spec['name']}（已存在且校验通过）")
+                ok += 1
+                continue
+            print(f"  [!] {spec['name']} 内容与本脚本记录不符，重新下载")
+
+        print(f"  下载 {spec['name']}  ({size_mb:.1f} MB)  —— {spec['desc']}")
+        try:
+            _download_file(spec["url"], dest)
+        except Exception as e:
+            print(f"  [X] {spec['name']} 下载失败: {e}")
+            continue
+
+        actual_size = os.path.getsize(dest) if os.path.exists(dest) else -1
+        if actual_size != spec["size"]:
+            print(f"  [X] {spec['name']} 大小不符（期望 {spec['size']}，实际 {actual_size}）")
+            continue
+        got = _sha256_of(dest)
+        if got != spec["sha256"]:
+            print(f"  [X] {spec['name']} sha256 不符\n      期望 {spec['sha256']}\n      实际 {got}")
+            continue
+        print(f"  [OK] {spec['name']} 校验通过")
+        ok += 1
+
+    total = len(_SEPARATION_FILES)
+    print(f"分离权重就绪 ({ok}/{total})")
+    return ok == total
+
+
 def main():
     """主函数"""
     print("=" * 60)
@@ -259,7 +386,11 @@ def main():
     if not download_faster_whisper_model():
         print("Faster-Whisper大型模型下载未完全成功")
     
-    # 5. IndexTTS-2.5 权重：不在本脚本内处理，必须用专用脚本（ModelScope 源）
+    # 5. 下载人声/伴奏分离权重（UVR5：BS-Roformer / HP2）
+    if not download_separation_models():
+        print("分离权重下载未完全成功")
+    
+    # 6. IndexTTS-2.5 权重：不在本脚本内处理，必须用专用脚本（ModelScope 源）
     print("=" * 60)
     print("提示：IndexTTS-2.5 权重请单独执行： python Download_indextts25.py")
     print("=" * 60)
