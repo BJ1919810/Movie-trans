@@ -672,6 +672,19 @@ def main():
         print()
         run_ref_check(diarization_file, clips_dir)
 
+    # -----------------------------------------------------------------
+    # Windows 退出兜底（2026-09-15）：本进程同时持有 torch(CUDA) +
+    # funasr(onnxruntime/sentencepiece) + ctranslate2 三套 C 运行时，
+    # 解释器 shutdown 阶段销毁它们会在 C 层 abort（Fatal Python error:
+    # Aborted，无堆栈无消息）→ 子进程 returncode!=0，UI 误报"识别失败"，
+    # 但识别结果和 JSON 其实早已完整写出。这里在 main() 末尾显式 flush
+    # 后直接退出，跳过 shutdown 清理（显存/内存由操作系统回收）。
+    # 注意：--only-ref-check 分支在上方已 return，不经过这里（它不崩）。
+    # -----------------------------------------------------------------
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
 
 if __name__ == "__main__":
     main()
