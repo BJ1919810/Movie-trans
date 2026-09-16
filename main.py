@@ -756,10 +756,10 @@ with gr.Blocks(title="Movie-trans 视频处理全流程") as demo:
                     with gr.Row():
                         asr_cluster_threshold = gr.Slider(
                             label="聚类阈值（越高说话人越少）",
-                            minimum=0.40, maximum=0.95, value=0.72, step=0.01
+                            minimum=0.40, maximum=0.95, value=0.5, step=0.01
                         )
                         asr_min_cluster_size = gr.Number(
-                            label="最小簇大小（越小越易分出短插话）", value=15, precision=0
+                            label="最小簇大小（越小越易分出短插话）", value=13, precision=0
                         )
                     gr.Markdown(
                         "<small>**切段粒度**决定时间轴粗细，直接影响后面每段 TTS 的长短："
@@ -896,7 +896,7 @@ with gr.Blocks(title="Movie-trans 视频处理全流程") as demo:
                         )
                         with gr.Row():
                             merge_align_max_rate = gr.Slider(
-                                label="最大伸缩倍率", minimum=1.0, maximum=2.0, value=1.25, step=0.05,
+                                label="最大伸缩倍率", minimum=1.0, maximum=2.0, value=1.1, step=0.05,
                                 info="1.25 = 语速最多变 ±25%，防止为对齐把语速拉变形"
                             )
                             merge_align_min_dev = gr.Slider(
