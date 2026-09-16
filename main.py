@@ -676,7 +676,7 @@ with gr.Blocks(title="Movie-trans 视频处理全流程") as demo:
     gr.Markdown("# 🎬 Movie-trans 视频处理全流程")
     gr.Markdown(
         "抽音频 → 降噪分离 → 说话人分离 / ASR → 标注校对 → 翻译 → 批量 TTS → 回填合片。\n\n"
-        "> **⚙️ 折叠区 = 高级参数**，都已按最优值预设，不确定就别动。\n"
+        "> **⚙️ 折叠区 = 高级参数**，均已预设为推荐值；如需调整，建议先了解各参数的作用。\n"
         "> **TTS 必须单进程线性跑**：同时开两个进程不会报 OOM，而是静默降质（听起来像严重失真的噪声）。"
     )
 
@@ -866,7 +866,7 @@ with gr.Blocks(title="Movie-trans 视频处理全流程") as demo:
                     with gr.Accordion("⚙️ 高级：TTS 参数", open=False):
                         tts_spk_ref_mode = gr.Radio(
                             label="音色参考策略", choices=["segment", "fixed"], value="segment",
-                            info="segment=每段用自身原片切片（同声配音正确解）；fixed=每说话人固定一段（更快但音色情绪会漂）"
+                            info="segment=每段用自身原片切片（推荐，逐段跟随原声表演）/ fixed=每说话人固定一段（更快，但音色与情绪会漂移）"
                         )
                         tts_emo_alpha = gr.Slider(
                             label="情绪强度 α", minimum=0.0, maximum=1.0, value=1.0, step=0.05
@@ -897,7 +897,7 @@ with gr.Blocks(title="Movie-trans 视频处理全流程") as demo:
                         with gr.Row():
                             merge_align_max_rate = gr.Slider(
                                 label="最大伸缩倍率", minimum=1.0, maximum=2.0, value=1.1, step=0.05,
-                                info="1.25 = 语速最多变 ±25%，防止为对齐把语速拉变形"
+                                info="值 = 允许的最大语速变化幅度（默认 1.1 = 最多 ±10%），防止为对齐把语速拉变形"
                             )
                             merge_align_min_dev = gr.Slider(
                                 label="偏差阈值（低于此值不动）", minimum=0.0, maximum=0.3, value=0.05, step=0.01
